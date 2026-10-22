@@ -1,6 +1,5 @@
 use std::{
     cell::RefCell,
-    io::Write,
     path::PathBuf,
     rc::Rc,
     time::{
@@ -25,8 +24,16 @@ use alacritty_terminal::{
         SelectionType,
     },
     term::{
+        Config as TermConfig,
         Term,
         TermMode,
+    },
+    vte::{
+        Parser as VteParser,
+        ansi::{
+            Processor,
+            StdSyncHandler,
+        },
     },
 };
 use freya_core::{
@@ -36,19 +43,26 @@ use freya_core::{
         TaskHandle,
         UseId,
         UserEvent,
+        spawn_forever,
     },
 };
+use futures_lite::StreamExt;
 use keyboard_types::{
     Key,
     Modifiers,
     NamedKey,
 };
-use portable_pty::{
-    MasterPty,
-    PtySize,
-};
 
 use crate::{
+    backends::{
+        TerminalBackend,
+        TerminalOutput,
+        pty::PtyBackend,
+    },
+    osc7::{
+        CwdSink,
+        parse_cwd_url,
+    },
     parser::{
         TerminalMouseButton,
         encode_mouse_move,
@@ -59,7 +73,6 @@ use crate::{
     pty::{
         EventProxy,
         TermSize,
-        spawn_pty,
     },
     url::url_at,
 };
@@ -86,6 +99,12 @@ pub enum TerminalError {
     #[error("Write error: {0}")]
     WriteError(String),
 
+    #[error("Start error: {0}")]
+    StartError(String),
+
+    #[error("Backend closed")]
+    Closed,
+
     #[error("Terminal not initialized")]
     NotInitialized,
 }
@@ -96,10 +115,17 @@ impl From<std::io::Error> for TerminalError {
     }
 }
 
-/// Cleans up the PTY and the reader task when the last handle is dropped.
+/// 终端字节流后端的共享句柄。`None` 表示后端已结束（进程退出或读取端关闭）。
+///
+/// 用 `Rc<RefCell<..>>` 是因为所有访问都发生在 UI 线程与终端泵任务上：泵任务读到
+/// 字节后调 `processor.advance`，期间 `Term` 可能经 `EventProxy` 回写（DSR 光标位置
+/// 报告等），同一条路径又会借这个 `RefCell`；两者借用互不嵌套，不会冲突。
+pub(crate) type SharedBackend = Rc<RefCell<Option<Box<dyn TerminalBackend>>>>;
+
+/// Cleans up the backend and the reader task when the last handle is dropped.
 pub(crate) struct TerminalCleaner {
-    /// Writer handle for the PTY.
-    pub(crate) writer: Rc<RefCell<Option<Box<dyn Write + Send>>>>,
+    /// Program the terminal is attached to, dropped to stop it.
+    pub(crate) backend: SharedBackend,
     /// PTY reader/parser task.
     pub(crate) pty_task: TaskHandle,
     /// Notifier that signals when the terminal should close.
@@ -108,7 +134,6 @@ pub(crate) struct TerminalCleaner {
 
 /// Handle-local state grouped into a single `RefCell`.
 pub(crate) struct TerminalInner {
-    pub(crate) master: Box<dyn MasterPty + Send>,
     pub(crate) last_write_time: Instant,
     pub(crate) pressed_button: Option<TerminalMouseButton>,
     pub(crate) modifiers: Modifiers,
@@ -116,7 +141,7 @@ pub(crate) struct TerminalInner {
 
 impl Drop for TerminalCleaner {
     fn drop(&mut self) {
-        *self.writer.borrow_mut() = None;
+        *self.backend.borrow_mut() = None;
         self.pty_task.try_cancel();
         self.closer_notifier.notify();
     }
@@ -133,9 +158,9 @@ pub struct TerminalHandle {
     /// alacritty's terminal model: grid, modes, scrollback. The renderer
     /// borrows this directly during paint, so there is no parallel snapshot.
     pub(crate) term: Rc<RefCell<Term<EventProxy>>>,
-    /// Writer for sending input to the PTY process.
-    pub(crate) writer: Rc<RefCell<Option<Box<dyn Write + Send>>>>,
-    /// Handle-local state (PTY master, input tracking).
+    /// Program the terminal is attached to, `None` once it has closed.
+    pub(crate) backend: SharedBackend,
+    /// Handle-local state (input tracking).
     pub(crate) inner: Rc<RefCell<TerminalInner>>,
     /// Current working directory reported by the shell via OSC 7.
     pub(crate) cwd: Rc<RefCell<Option<PathBuf>>>,
@@ -182,7 +207,109 @@ impl TerminalHandle {
         command: portable_pty::CommandBuilder,
         scrollback_length: Option<usize>,
     ) -> Result<Self, TerminalError> {
-        spawn_pty(id, command, scrollback_length.unwrap_or(1000))
+        Self::new_with_backend(id, Box::new(PtyBackend::new(command)), scrollback_length)
+    }
+
+    /// Attach `backend` (local PTY, SSH channel, …) and return a handle driving it.
+    /// Defaults to 1000 lines of scrollback when `scrollback_length` is `None`.
+    ///
+    /// The backend is started immediately and is dropped — thereby stopped — when
+    /// the last handle dies or when the output side closes.
+    pub fn new_with_backend(
+        id: TerminalId,
+        mut backend: Box<dyn TerminalBackend>,
+        scrollback_length: Option<usize>,
+    ) -> Result<Self, TerminalError> {
+        // 有界输出通道：后端产出快于解析时，读线程阻塞在 write 上，背压传回子进程
+        // （容量与语义见 backends::TerminalOutput 的文档）。
+        let (output, mut receiver) = TerminalOutput::channel();
+        backend.start(output)?;
+        let backend: SharedBackend = Rc::new(RefCell::new(Some(backend)));
+
+        let closer_notifier = ArcNotify::new();
+        let output_notifier = ArcNotify::new();
+        let title_notifier = ArcNotify::new();
+        let cwd: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
+        let title: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let clipboard_content: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let clipboard_notifier = ArcNotify::new();
+
+        let event_proxy = EventProxy {
+            backend: backend.clone(),
+            title: title.clone(),
+            title_notifier: title_notifier.clone(),
+            clipboard_content: clipboard_content.clone(),
+            clipboard_notifier: clipboard_notifier.clone(),
+        };
+
+        let term_config = TermConfig {
+            scrolling_history: scrollback_length.unwrap_or(1000),
+            ..TermConfig::default()
+        };
+        let initial_size = TermSize {
+            screen_lines: 24,
+            columns: 80,
+        };
+        let term = Rc::new(RefCell::new(Term::new(
+            term_config,
+            &initial_size,
+            event_proxy,
+        )));
+
+        let inner = Rc::new(RefCell::new(TerminalInner {
+            last_write_time: Instant::now(),
+            pressed_button: None,
+            modifiers: Modifiers::empty(),
+        }));
+
+        let platform = Platform::get();
+        let pty_task = spawn_forever({
+            let term = term.clone();
+            let backend = backend.clone();
+            let closer_notifier = closer_notifier.clone();
+            let output_notifier = output_notifier.clone();
+            let cwd = cwd.clone();
+            async move {
+                let mut processor = Processor::<StdSyncHandler>::new();
+                // Side-channel parser for OSC 7 (cwd), which alacritty drops.
+                let mut cwd_parser = VteParser::new();
+                let mut cwd_sink = CwdSink::default();
+                while let Some(bytes) = receiver.next().await {
+                    processor.advance(&mut *term.borrow_mut(), &bytes);
+
+                    cwd_parser.advance(&mut cwd_sink, &bytes);
+                    if let Some(url) = cwd_sink.take() {
+                        *cwd.borrow_mut() = Some(parse_cwd_url(&url));
+                    }
+
+                    output_notifier.notify();
+                    platform.send(UserEvent::RequestRedraw);
+                }
+                // Output channel closed: drop the backend and notify observers.
+                *backend.borrow_mut() = None;
+                closer_notifier.notify();
+                platform.send(UserEvent::RequestRedraw);
+            }
+        });
+
+        Ok(TerminalHandle {
+            closer_notifier: closer_notifier.clone(),
+            cleaner: Rc::new(TerminalCleaner {
+                backend: backend.clone(),
+                pty_task,
+                closer_notifier,
+            }),
+            id,
+            term,
+            backend,
+            inner,
+            cwd,
+            title,
+            title_notifier,
+            clipboard_content,
+            clipboard_notifier,
+            output_notifier,
+        })
     }
 
     /// Write data to the PTY. Drops any selection and snaps the viewport to the bottom.
@@ -297,24 +424,21 @@ impl TerminalHandle {
         Ok(())
     }
 
-    /// Write data to the PTY without resetting scroll or selection state.
+    /// Write data to the backend without resetting scroll or selection state.
     fn write_raw(&self, data: &[u8]) -> Result<(), TerminalError> {
-        let mut writer = self.writer.borrow_mut();
-        let writer = writer.as_mut().ok_or(TerminalError::NotInitialized)?;
-        writer.write_all(data)?;
-        writer.flush()?;
-        Ok(())
+        let mut slot = self.backend.borrow_mut();
+        // 后端已结束（进程退出 / 读取端关闭 / 输出通道关闭）时报 Closed，与其它
+        // 关闭路径（TerminalOutput::write、PtyBackend::write）的措辞一致。
+        let backend = slot.as_mut().ok_or(TerminalError::Closed)?;
+        backend.write(data)
     }
 
     /// Resize the terminal. Lossless: the grid reflows on width, preserves scrollback on height.
     pub fn resize(&self, rows: u16, cols: u16) {
-        // PTY first so SIGWINCH reaches the program before we update locally.
-        let _ = self.inner.borrow().master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        // Backend first so SIGWINCH reaches the program before we update locally.
+        if let Some(backend) = self.backend.borrow_mut().as_mut() {
+            backend.resize(rows, cols);
+        }
 
         self.term.borrow_mut().resize(TermSize {
             screen_lines: rows as usize,

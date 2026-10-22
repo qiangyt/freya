@@ -67,6 +67,7 @@
 //! ## Advance usage
 //!
 //! Check the `feature_terminal.rs` example in the repository.
+pub mod backends;
 pub mod colors;
 pub mod element;
 pub mod handle;
@@ -82,6 +83,11 @@ pub mod prelude {
     pub use portable_pty::CommandBuilder;
 
     pub use crate::{
+        backends::{
+            TerminalBackend,
+            TerminalOutput,
+            pty::PtyBackend,
+        },
         element::Terminal,
         handle::{
             TerminalError,
