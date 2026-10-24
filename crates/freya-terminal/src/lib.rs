@@ -86,6 +86,7 @@ pub mod prelude {
         backends::{
             TerminalBackend,
             TerminalOutput,
+            pipe::PipeBackend,
             pty::PtyBackend,
         },
         element::Terminal,

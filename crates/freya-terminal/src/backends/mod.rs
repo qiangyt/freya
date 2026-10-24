@@ -1,6 +1,7 @@
 //! Terminal I/O 后端抽象（0.4.3 backport，蓝本 = 上游 0.5 crates/freya-terminal/src/backends/）。
 //! 只 backport trait/通道/PTY 实现与 handle 接线模式；不搬上游的 rio-vt 引擎。
 
+pub mod pipe;
 pub mod pty;
 
 use std::{
