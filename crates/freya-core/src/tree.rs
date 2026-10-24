@@ -388,6 +388,7 @@ impl Tree {
                             element,
                             &mut self.accessibility_diff,
                             &mut self.accessibility_groups,
+                            &self.accessibility_generator,
                         ),
                         None => {
                             self.accessibility_state.insert(

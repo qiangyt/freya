@@ -414,6 +414,18 @@ pub struct AccessibilityState {
     pub a11y_id: AccessibilityId,
     pub a11y_focusable: Focusable,
     pub a11y_member_of: Option<AccessibilityId>,
+    /// Whether the current `a11y_id` came from the element's explicit
+    /// automation id (task-32, 2026-10-24). freya's sibling diff matches
+    /// keyless children positionally, so inserting a conditional child
+    /// reuses an existing node for a *different* element; when that new
+    /// element carries no explicit automation id, the node must re-derive a
+    /// counter id instead of keeping the previous element's id -- otherwise
+    /// the stale id lingers beside the new element that now claims it, one
+    /// accesskit TreeUpdate ends up listing the same NodeId under two
+    /// parents, and accesskit_consumer panics ("TreeUpdate includes
+    /// duplicate child"), which freya-winit's release panic hook turns into
+    /// a blocking Fatal Error dialog.
+    pub a11y_id_from_element: bool,
 }
 
 impl AccessibilityState {
@@ -426,11 +438,13 @@ impl AccessibilityState {
     ) -> Self {
         let data = element.accessibility();
 
-        let a11y_id = if node_id == NodeId::ROOT {
-            ACCESSIBILITY_ROOT_ID
+        let (a11y_id, a11y_id_from_element) = if node_id == NodeId::ROOT {
+            (ACCESSIBILITY_ROOT_ID, false)
         } else {
-            data.a11y_id
-                .unwrap_or_else(|| AccessibilityId(accessibility_generator.new_id()))
+            match data.a11y_id {
+                Some(id) => (id, true),
+                None => (AccessibilityId(accessibility_generator.new_id()), false),
+            }
         };
 
         accessibility_diff.add_or_update(node_id);
@@ -451,6 +465,7 @@ impl AccessibilityState {
             a11y_id,
             a11y_focusable: data.a11y_focusable.clone(),
             a11y_member_of: data.builder.member_of(),
+            a11y_id_from_element,
         }
     }
 
@@ -475,6 +490,7 @@ impl AccessibilityState {
         element: &Rc<dyn ElementExt>,
         accessibility_diff: &mut AccessibilityDirtyNodes,
         accessibility_groups: &mut AccessibilityGroups,
+        accessibility_generator: &AccessibilityGenerator,
     ) {
         let data = element.accessibility();
 
@@ -485,11 +501,26 @@ impl AccessibilityState {
             group.retain(|id| *id != self.a11y_id);
         }
 
-        if let Some(a11y_id) = data.a11y_id
-            && self.a11y_id != a11y_id
-        {
-            accessibility_diff.add_or_update(node_id);
-            self.a11y_id = a11y_id;
+        match data.a11y_id {
+            Some(a11y_id) => {
+                if self.a11y_id != a11y_id {
+                    accessibility_diff.add_or_update(node_id);
+                    self.a11y_id = a11y_id;
+                }
+                self.a11y_id_from_element = true;
+            }
+            // The element no longer carries an explicit automation id while
+            // this node still holds one (task-32: the positional sibling diff
+            // reused the node for a different element). Re-derive a counter
+            // id: keeping the stale id would leave two nodes claiming one
+            // accesskit NodeId in the same tree update, which
+            // accesskit_consumer rejects with a panic.
+            None if self.a11y_id_from_element && node_id != NodeId::ROOT => {
+                self.a11y_id = AccessibilityId(accessibility_generator.new_id());
+                self.a11y_id_from_element = false;
+                accessibility_diff.add_or_update(node_id);
+            }
+            None => {}
         }
 
         if let Some(member_of) = data.builder.member_of() {
@@ -513,4 +544,101 @@ pub struct AccessibilityData {
     pub a11y_auto_focus: bool,
     pub a11y_focusable: Focusable,
     pub builder: accesskit::Node,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::elements::rect::RectElement;
+
+    /// A rect carrying an explicit automation id (the `automation_id(...)`
+    /// shape; the app's contract ids land here).
+    fn rect_with_id(id: AccessibilityId) -> Rc<dyn ElementExt> {
+        let mut element = RectElement::default();
+        element.accessibility.a11y_id = Some(id);
+        Rc::new(element)
+    }
+
+    /// A plain rect with no explicit id (counter-id territory).
+    fn rect_plain() -> Rc<dyn ElementExt> {
+        Rc::new(RectElement::default())
+    }
+
+    /// task-32 regression: freya's sibling diff matches keyless children
+    /// positionally, so a conditional child insertion reuses an existing
+    /// node for a different element. When the new element carries no
+    /// explicit automation id, the node must re-derive a counter id --
+    /// keeping the old element's id left two nodes claiming one accesskit
+    /// NodeId in the same tree update, and accesskit_consumer panicked
+    /// ("TreeUpdate includes duplicate child").
+    #[test]
+    fn update_rederives_the_id_when_the_element_loses_its_explicit_id() {
+        let generator = AccessibilityGenerator::default();
+        let mut diff = AccessibilityDirtyNodes::default();
+        let mut groups = AccessibilityGroups::default();
+        let node = NodeId::PLACEHOLDER;
+
+        let tagged = rect_with_id(AccessibilityId(0xDEAD_BEEF));
+        let mut state =
+            AccessibilityState::create(node, &tagged, &mut diff, &generator, &mut groups);
+        assert_eq!(state.a11y_id, AccessibilityId(0xDEAD_BEEF));
+        assert!(state.a11y_id_from_element);
+
+        let plain = rect_plain();
+        state.update(node, &plain, &mut diff, &mut groups, &generator);
+        assert_ne!(
+            state.a11y_id,
+            AccessibilityId(0xDEAD_BEEF),
+            "a node reused for an id-less element must not keep the previous element's id"
+        );
+        assert!(!state.a11y_id_from_element);
+
+        // The derived id is stable across later updates of the same element.
+        let derived = state.a11y_id;
+        state.update(node, &plain, &mut diff, &mut groups, &generator);
+        assert_eq!(state.a11y_id, derived);
+    }
+
+    /// The everyday path must not churn: a stable explicit id survives
+    /// frame after frame, and a *changed* explicit id is adopted.
+    #[test]
+    fn update_tracks_explicit_ids_without_churn() {
+        let generator = AccessibilityGenerator::default();
+        let mut diff = AccessibilityDirtyNodes::default();
+        let mut groups = AccessibilityGroups::default();
+        let node = NodeId::PLACEHOLDER;
+
+        let tagged = rect_with_id(AccessibilityId(7));
+        let mut state =
+            AccessibilityState::create(node, &tagged, &mut diff, &generator, &mut groups);
+        state.update(node, &tagged, &mut diff, &mut groups, &generator);
+        assert_eq!(state.a11y_id, AccessibilityId(7));
+
+        let retagged = rect_with_id(AccessibilityId(9));
+        state.update(node, &retagged, &mut diff, &mut groups, &generator);
+        assert_eq!(state.a11y_id, AccessibilityId(9));
+        assert!(state.a11y_id_from_element);
+    }
+
+    /// The root node keeps its reserved id regardless of element swaps.
+    #[test]
+    fn root_keeps_its_reserved_id() {
+        let generator = AccessibilityGenerator::default();
+        let mut diff = AccessibilityDirtyNodes::default();
+        let mut groups = AccessibilityGroups::default();
+
+        let tagged = rect_with_id(AccessibilityId(7));
+        let mut state =
+            AccessibilityState::create(NodeId::ROOT, &tagged, &mut diff, &generator, &mut groups);
+        assert_eq!(state.a11y_id, ACCESSIBILITY_ROOT_ID);
+
+        state.update(
+            NodeId::ROOT,
+            &rect_plain(),
+            &mut diff,
+            &mut groups,
+            &generator,
+        );
+        assert_eq!(state.a11y_id, ACCESSIBILITY_ROOT_ID);
+    }
 }

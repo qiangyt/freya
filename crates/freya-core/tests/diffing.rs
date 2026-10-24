@@ -1075,10 +1075,10 @@ fn tree_unordered_mutations() {
         let mut show = use_state(|| false);
         rect()
             .on_mouse_up(move |_| show.toggle())
-            .maybe_child(show().then(|| from_fn_captured(|| counter())))
+            .maybe_child(show().then(|| from_fn_captured(counter)))
             .child(rect().key(1))
             .child(rect().key(2))
-            .maybe_child(show().then(|| rect()))
+            .maybe_child(show().then(rect))
             .into()
     }
 
@@ -1574,7 +1574,7 @@ fn ordered_scope_mutations_diffing() {
             .expanded()
             .background((255, 255, 255))
             .on_mouse_up(move |_| enable.toggle())
-            .maybe_child(enable().then(|| "hi"))
+            .maybe_child(enable().then_some("hi"))
             .child(rect().key(0).child(from_fn_standalone_borrowed_keyed(
                 DiffKey::from(&enable()),
                 (),
