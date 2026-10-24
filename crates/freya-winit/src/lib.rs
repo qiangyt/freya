@@ -62,6 +62,15 @@ pub fn launch(mut launch_config: LaunchConfig) {
     {
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
+            // The dialog below blocks this thread indefinitely: it is a modal
+            // message pump nobody may dismiss in an unattended environment,
+            // and it used to run BEFORE any logging, so panics that reached
+            // this hook surfaced only as a silent "event loop alive but
+            // nothing renders anymore" freeze (measured twice from the
+            // putala-desktop e2e: an accesskit duplicate-child panic and a
+            // UI state borrow panic, 2026-10-24). Log the panic through the
+            // normal subscriber first, then keep the dialog face.
+            tracing::error!("PANIC: {panic_info}");
             rfd::MessageDialog::new()
                 .set_title("Fatal Error")
                 .set_description(&panic_info.to_string())

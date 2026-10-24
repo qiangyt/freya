@@ -35,7 +35,10 @@
 
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{
+        Cell,
+        RefCell,
+    },
     collections::HashMap,
     fs::File,
     io::Write,
@@ -86,10 +89,42 @@ pub mod prelude {
 
     pub use crate::{
         DocRunner,
+        RedrawCount,
         TestingRunner,
         launch_doc,
         launch_test,
     };
+}
+
+/// Headless redraw observation: everything this runner saw that freya-winit
+/// would have turned into a `window.request_redraw()` call.
+///
+/// Two sources, mirroring freya-winit's renderer:
+/// - [`RedrawCount::requests`]: explicit `UserEvent::RequestRedraw` events the
+///   app sent through the `Platform` sender (freya-terminal output, animation
+///   hooks, ...). In freya-winit these land on `app.window.request_redraw()`
+///   (renderer.rs, `UserEvent::RequestRedraw` arm); here they are only counted.
+/// - [`RedrawCount::mutation_batches`]: `sync_and_update` rounds whose mutation
+///   batch would have requested a redraw in freya-winit's `PollRunner`
+///   (`needs_render` or `needs_accessibility` on the applied mutations). This
+///   is the "a UI change happened" source that headless otherwise has no face
+///   for: a plain state write produces NO `RequestRedraw` event, the winit
+///   renderer derives the redraw from the mutation batch instead.
+///
+/// Counts accumulate for the runner's whole life (the initial mount batch
+/// included). Read them with [`TestingRunner::redraw_count`].
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RedrawCount {
+    pub requests: u64,
+    pub mutation_batches: u64,
+}
+
+impl RedrawCount {
+    /// Both sources together: the total number of redraws a real window would
+    /// have been asked for.
+    pub fn total(&self) -> u64 {
+        self.requests + self.mutation_batches
+    }
 }
 
 type DocRunnerHook = Box<dyn FnOnce(&mut TestingRunner)>;
@@ -167,6 +202,10 @@ pub struct TestingRunner {
     animation_clock: AnimationClock,
     ticker_sender: RenderingTickerSender,
 
+    /// Shared with the `Platform` sender closure below: explicit
+    /// `UserEvent::RequestRedraw` observations.
+    redraw_count: Rc<Cell<RedrawCount>>,
+
     default_fonts: Vec<Cow<'static, str>>,
     scale_factor: f64,
 }
@@ -197,8 +236,11 @@ impl TestingRunner {
         let requested_focus_strategy: Rc<RefCell<Option<AccessibilityFocusStrategy>>> =
             Rc::new(RefCell::new(None));
 
+        let redraw_count = Rc::new(Cell::new(RedrawCount::default()));
+
         let platform = runner.provide_root_context({
             let requested_focus_strategy = requested_focus_strategy.clone();
+            let redraw_count = redraw_count.clone();
             || Platform {
                 focused_accessibility_id: State::create(ACCESSIBILITY_ROOT_ID),
                 focused_accessibility_node: State::create(accesskit::Node::new(
@@ -213,7 +255,10 @@ impl TestingRunner {
                 sender: Rc::new(move |user_event| {
                     match user_event {
                         UserEvent::RequestRedraw => {
-                            // Nothing
+                            redraw_count.set(RedrawCount {
+                                requests: redraw_count.get().requests + 1,
+                                ..redraw_count.get()
+                            });
                         }
                         UserEvent::FocusAccessibilityNode(strategy) => {
                             requested_focus_strategy.borrow_mut().replace(strategy);
@@ -274,6 +319,8 @@ impl TestingRunner {
             animation_clock,
             ticker_sender,
 
+            redraw_count,
+
             default_fonts: default_fonts(),
             scale_factor,
         };
@@ -322,6 +369,14 @@ impl TestingRunner {
         self.runner.handle_events().await
     }
 
+    /// The redraw observations accumulated so far (see [`RedrawCount`]). A
+    /// growing count means the app is still producing redraw-worthy work; a
+    /// count that stops growing while the app has pending work is the headless
+    /// witness of a "redraws stop being requested" failure.
+    pub fn redraw_count(&self) -> RedrawCount {
+        self.redraw_count.get()
+    }
+
     pub fn handle_events_immediately(&mut self) {
         self.runner.handle_events_immediately()
     }
@@ -356,9 +411,20 @@ impl TestingRunner {
         }
 
         let mutations = self.runner.sync_and_update();
-        self.runner.run_in(|| {
-            self.tree.borrow_mut().apply_mutations(mutations);
-        });
+        let result = self
+            .runner
+            .run_in(|| self.tree.borrow_mut().apply_mutations(mutations));
+        // The mutation batch is the face freya-winit's PollRunner derives its
+        // `window.request_redraw()` calls from (`needs_render` -> force layout
+        // + redraw, `needs_accessibility` -> accessibility task + redraw); a
+        // batch that would have redrawn a real window counts here.
+        if result.needs_render || result.needs_accessibility {
+            let count = self.redraw_count.get();
+            self.redraw_count.set(RedrawCount {
+                mutation_batches: count.mutation_batches + 1,
+                ..count
+            });
+        }
         self.tree.borrow_mut().measure_layout(
             self.size,
             &mut self.font_collection,
