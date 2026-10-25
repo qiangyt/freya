@@ -148,6 +148,19 @@ impl AccessibilityTree {
             }
         }
 
+        // Drop the current mappings of every node that is about to be
+        // re-registered before inserting their (possibly new) ids. A node
+        // whose id was re-derived (see `AccessibilityState::update`) must
+        // not keep its old id mapped: the stale entry made the focus
+        // fallback below believe a dead focused id was still alive, and
+        // `TreeUpdate::focus` then pointed accesskit at a removed node,
+        // which makes accesskit_consumer panic ("Focused ID is not in the
+        // node list").
+        if !added_or_updated_ids.is_empty() {
+            self.map
+                .retain(|_, mapped_node_id| !added_or_updated_ids.contains(mapped_node_id));
+        }
+
         // Register the created/updated nodes
         for node_id in added_or_updated_ids.clone() {
             let accessibility_state = tree.accessibility_state.get(&node_id).unwrap();
@@ -487,5 +500,154 @@ fn color_to_accesskit(color: Color) -> accesskit::Color {
         green: color.g(),
         blue: color.b(),
         alpha: color.a(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::{
+        data::AccessibilityState,
+        element::ElementExt,
+        elements::rect::RectElement,
+    };
+
+    /// A rect carrying an explicit automation id.
+    fn rect_with_id(id: AccessibilityId) -> Rc<dyn ElementExt> {
+        let mut element = RectElement::default();
+        element.accessibility.a11y_id = Some(id);
+        Rc::new(element)
+    }
+
+    /// A plain rect with no explicit id (counter-id territory).
+    fn rect_plain() -> Rc<dyn ElementExt> {
+        Rc::new(RectElement::default())
+    }
+
+    /// A minimal tree: ROOT with a single child `node` bound to `element`,
+    /// with accessibility states registered through the regular
+    /// `AccessibilityState::create` path (so the diff is populated the same
+    /// way the real renderer does).
+    fn mini_tree(node: NodeId, element: &Rc<dyn ElementExt>) -> Tree {
+        let mut tree = Tree::default();
+
+        let root_element: Rc<dyn ElementExt> = Rc::new(RectElement::default());
+        let root_state = AccessibilityState::create(
+            NodeId::ROOT,
+            &root_element,
+            &mut tree.accessibility_diff,
+            &tree.accessibility_generator,
+            &mut tree.accessibility_groups,
+        );
+        tree.elements.insert(NodeId::ROOT, root_element);
+        tree.accessibility_state.insert(NodeId::ROOT, root_state);
+        tree.children.insert(NodeId::ROOT, vec![node]);
+        tree.layout.cache_node(NodeId::ROOT, LayoutNode::default());
+
+        let state = AccessibilityState::create(
+            node,
+            element,
+            &mut tree.accessibility_diff,
+            &tree.accessibility_generator,
+            &mut tree.accessibility_groups,
+        );
+        tree.elements.insert(node, element.clone());
+        tree.accessibility_state.insert(node, state);
+        tree.parents.insert(node, NodeId::ROOT);
+        tree.layout.cache_node(node, LayoutNode::default());
+
+        tree
+    }
+
+    /// task-41 C1 regression: when a node's element loses its explicit
+    /// automation id, `AccessibilityState::update` re-derives a counter id.
+    /// Registering that update must drop the node's old id from the map --
+    /// leaving it in place made the focus fallback believe a dead focused
+    /// id was still alive, and `TreeUpdate::focus` then pointed accesskit
+    /// at a removed node, which makes accesskit_consumer panic
+    /// ("Focused ID is not in the node list").
+    #[test]
+    fn id_rederivation_drops_the_stale_mapping_and_the_stale_focus() {
+        let node = NodeId::PLACEHOLDER;
+        let explicit_id = AccessibilityId(0xDEAD_BEEF);
+
+        let mut tree = mini_tree(node, &rect_with_id(explicit_id));
+        let mut a11y_tree = AccessibilityTree::new(ACCESSIBILITY_ROOT_ID);
+        let (events_sender, _events_receiver) = futures_channel::mpsc::unbounded();
+
+        let update = a11y_tree.process_updates(&mut tree, &events_sender);
+        assert_eq!(update.focus, ACCESSIBILITY_ROOT_ID);
+        assert_eq!(a11y_tree.map.get(&explicit_id), Some(&node));
+
+        // The node holds focus through its explicit id.
+        a11y_tree.focused_id = explicit_id;
+
+        // The element is swapped for one without an explicit id: the state
+        // re-derives a new counter id and marks the node as updated.
+        let plain = rect_plain();
+        tree.accessibility_state.get_mut(&node).unwrap().update(
+            node,
+            &plain,
+            &mut tree.accessibility_diff,
+            &mut tree.accessibility_groups,
+            &tree.accessibility_generator,
+        );
+        let rederived_id = tree.accessibility_state.get(&node).unwrap().a11y_id;
+        assert_ne!(rederived_id, explicit_id);
+
+        let update = a11y_tree.process_updates(&mut tree, &events_sender);
+
+        // (a) The old id must no longer be mapped to the node: exactly one
+        // mapping per node, pointing at the node's current id.
+        assert!(
+            !a11y_tree.map.contains_key(&explicit_id),
+            "the re-derived id must replace the old mapping, not live beside it"
+        );
+        assert_eq!(a11y_tree.map.get(&rederived_id), Some(&node));
+
+        // (b) Focus must no longer point at the dead id, and the emitted
+        // focus must be an id that is actually registered in the map (the
+        // exact condition accesskit_consumer panics on when violated).
+        assert_ne!(a11y_tree.focused_id, explicit_id);
+        assert!(
+            a11y_tree.map.contains_key(&update.focus),
+            "TreeUpdate::focus must point at a registered node"
+        );
+    }
+
+    /// The everyday path must not churn: re-registering an updated node
+    /// whose id did not change keeps the mapping intact (also for the
+    /// focus, which stays on the unchanged id).
+    #[test]
+    fn unchanged_id_keeps_the_mapping_and_the_focus() {
+        let node = NodeId::PLACEHOLDER;
+        let explicit_id = AccessibilityId(0xAB_CD);
+
+        let mut tree = mini_tree(node, &rect_with_id(explicit_id));
+        let mut a11y_tree = AccessibilityTree::new(ACCESSIBILITY_ROOT_ID);
+        let (events_sender, _events_receiver) = futures_channel::mpsc::unbounded();
+
+        a11y_tree.process_updates(&mut tree, &events_sender);
+        a11y_tree.focused_id = explicit_id;
+
+        // Same element again: no id change, but the node is still marked as
+        // updated (e.g. an attribute changed elsewhere).
+        let tagged = rect_with_id(explicit_id);
+        tree.accessibility_state.get_mut(&node).unwrap().update(
+            node,
+            &tagged,
+            &mut tree.accessibility_diff,
+            &mut tree.accessibility_groups,
+            &tree.accessibility_generator,
+        );
+        tree.accessibility_diff.add_or_update(node);
+
+        let update = a11y_tree.process_updates(&mut tree, &events_sender);
+
+        assert_eq!(a11y_tree.map.get(&explicit_id), Some(&node));
+        assert_eq!(a11y_tree.focused_id, explicit_id);
+        assert_eq!(update.focus, explicit_id);
     }
 }

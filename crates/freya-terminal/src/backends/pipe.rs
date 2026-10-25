@@ -7,6 +7,15 @@ use std::{
         Command,
         Stdio,
     },
+    sync::{
+        Arc,
+        Mutex as StdMutex,
+        mpsc::TrySendError,
+    },
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use portable_pty::CommandBuilder;
@@ -16,6 +25,30 @@ use super::{
     TerminalOutput,
 };
 use crate::handle::TerminalError;
+
+/// The write-side enqueue budget (Task 43, I4): how long [`PipeBackend::write`]
+/// waits for a free slot in the writer queue before giving up this packet.
+/// The caller is the freya UI thread (the key handler), so the wait parks the
+/// whole UI for at most this long -- the same 200 ms ruling the SSH backend's
+/// write path made on 2026-10-23, now applied to the pipe transport too: the
+/// queue plus the OS pipe hold several hundred KiB, which normal typing can
+/// never fill; a full queue means the child stopped reading stdin.
+const WRITE_WAIT_BUDGET: Duration = Duration::from_millis(200);
+
+/// The retry cadence inside [`WRITE_WAIT_BUDGET`] (`try_send` is a cheap
+/// capacity check; the sleep is what bounds the UI thread's park).
+const WRITE_WAIT_POLL: Duration = Duration::from_millis(10);
+
+/// The writer queue's capacity, in chunks (one `write` call = one chunk).
+/// Bounded: together with the OS pipe buffer it is the hard cap on how much
+/// unparsed input may sit between the UI and a child that is not reading.
+const WRITE_QUEUE_CHUNKS: usize = 64;
+
+/// The reaper's poll cadence while waiting for the child to exit (a `wait()`
+/// would hold the child slot's lock for the child's whole lifetime and block
+/// Drop's kill on the UI thread; `try_wait` polling keeps every lock hold
+/// short).
+const REAP_POLL: Duration = Duration::from_millis(50);
 
 /// Raw-pipe backend: spawns `command` with stdin/stdout/stderr connected through
 /// plain OS pipes, no pseudo-terminal in the middle (the degraded local-terminal
@@ -32,18 +65,23 @@ use crate::handle::TerminalError;
 ///   it is merged into the same byte stream as stdout, with both flows stopped
 ///   before the child is reaped (see the reader threads in [`TerminalBackend::start`]).
 ///
-/// Reaping and the Drop contract follow the `PtyBackend` shape: the child moves
-/// into a reaper thread that joins the two readers and then `wait()`s (no
-/// zombie). One honest platform difference vs the PTY: a pipe has no
-/// master-handle close that would signal the child (Unix pty close raises
-/// SIGHUP, ConPTY dies with the pseudo console). Stopping this backend relies
-/// on dropping the stdin writer -- the child's stdin reads EOF, which is what
-/// conventional CLI programs exit on. A child that ignores stdin EOF outlives
-/// the backend; its readers keep draining until the output channel closes, and
-/// the reaper still reaps it afterwards.
+/// Reaping and the Drop contract follow the `PtyBackend` shape (backends/mod.rs:
+/// Drop must stop everything `start` launched): the child lives in a shared
+/// slot the reaper thread `try_wait`-polls (no zombie), and Drop KILLS it
+/// (Task 43, I4) -- a pipe has no master-handle close that would signal the
+/// child (Unix pty close raises SIGHUP, ConPTY dies with the pseudo console),
+/// and "drop the stdin writer and hope the child exits on EOF" leaves a
+/// stdin-ignoring child running forever. `write` enqueues into a bounded
+/// queue drained by a dedicated writer thread, so a child that stopped
+/// reading stdin cannot park the UI thread on the full OS pipe (the same
+/// 200 ms ruling the SSH backend's write path made).
 pub struct PipeBackend {
     command: CommandBuilder,
-    writer: Option<Box<dyn Write + Send>>,
+    /// The writer queue's sending end (None before `start` / after teardown).
+    writer: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    /// The child in the slot shared with the reaper thread (Drop kills
+    /// through it; the reaper reaps through it).
+    child: Option<Arc<StdMutex<std::process::Child>>>,
 }
 
 impl PipeBackend {
@@ -51,6 +89,7 @@ impl PipeBackend {
         Self {
             command,
             writer: None,
+            child: None,
         }
     }
 }
@@ -139,9 +178,30 @@ impl TerminalBackend for PipeBackend {
                     ));
                 }
             };
-        // All pieces ready before self state lands (same order discipline as
-        // pty.rs): any failure above leaves writer None and no orphan process.
-        self.writer = Some(Box::new(stdin));
+        // The child moves into the SHARED slot: the reaper thread reaps through
+        // it and Drop kills through it (Task 43, I4). The reaper NEVER holds
+        // the lock across a blocking wait -- a `wait()` there would hold it for
+        // the child's whole lifetime and Drop's kill (the UI thread) would
+        // block on it; `try_wait` polling keeps every hold short.
+        let child_slot: Arc<StdMutex<std::process::Child>> = Arc::new(StdMutex::new(child));
+        // The writer thread (Task 43, I4): the ONLY place `write_all` runs.
+        // The UI thread enqueues into the bounded queue below; a child that
+        // stopped reading stdin parks THIS thread on the full OS pipe, not the
+        // UI. The queue's sender is stored as the backend's `writer` face; the
+        // thread exits when the queue's senders are gone or the child's stdin
+        // broke (its write errors), whichever comes first.
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE_CHUNKS);
+        std::thread::spawn(move || {
+            let mut stdin = stdin;
+            for chunk in writer_rx {
+                if stdin.write_all(&chunk).is_err() || stdin.flush().is_err() {
+                    break; // the child is gone: nothing left to write
+                }
+            }
+            // dropping stdin here closes the child's stdin pipe (the EOF
+            // conventional CLI programs exit on -- the polite half of the
+            // teardown; Drop's kill is the guaranteed half).
+        });
         // stdout and stderr merge into the same output channel (the TerminalOutput
         // Clone shares one queue; two pipes interleave at chunk granularity, which
         // is the best a byte stream without PTY framing can do).
@@ -150,25 +210,97 @@ impl TerminalBackend for PipeBackend {
             move || pump(stdout, &output, "stdout")
         });
         let stderr_reader = std::thread::spawn(move || pump(stderr, &output, "stderr"));
-        // Reaper: both flows stopped first, so `wait` cannot race a reader that
-        // still holds buffered bytes (same reader-tail reap shape as pty.rs).
+        // Reaper: both flows stopped first, so the poll-wait cannot race a
+        // reader that still holds buffered bytes (same reader-tail reap shape
+        // as pty.rs); then try_wait-poll until the child is reaped (no zombie,
+        // no orphan) -- also covering the child that exited long ago while the
+        // backend stayed alive.
+        let reaper_slot = Arc::clone(&child_slot);
         std::thread::spawn(move || {
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            let _ = child.wait(); // reap, no zombie/orphan
+            loop {
+                let reaped = {
+                    let mut slot = reaper_slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    matches!(slot.try_wait(), Ok(Some(_)) | Err(_))
+                };
+                if reaped {
+                    return;
+                }
+                std::thread::sleep(REAP_POLL);
+            }
         });
+        // All pieces ready before self state lands (same order discipline as
+        // pty.rs): any failure above leaves writer/child None and no orphan
+        // process.
+        self.writer = Some(writer_tx);
+        self.child = Some(child_slot);
         Ok(())
     }
 
     fn write(&mut self, data: &[u8]) -> Result<(), TerminalError> {
-        let writer = self.writer.as_mut().ok_or(TerminalError::Closed)?;
-        writer.write_all(data)?;
-        writer.flush()?;
-        Ok(())
+        // Bounded enqueue (Task 43, I4): the old shape ran `write_all` on the
+        // CALLING thread (the freya UI thread), so a child that stopped
+        // reading stdin parked the whole app on the full OS pipe. The write
+        // now hands the chunk to the writer thread through a bounded queue:
+        // a transient backlog (a paste outrunning the child for a few ms) is
+        // still delivered whole, and after the budget the packet is given up
+        // with a readable error so the failure domain stays this one
+        // terminal -- the same ruling the SSH backend's write path made
+        // (2026-10-23), which this transport never had.
+        let writer = self.writer.as_ref().ok_or(TerminalError::Closed)?;
+        let deadline = Instant::now() + WRITE_WAIT_BUDGET;
+        let mut chunk = data.to_vec();
+        loop {
+            match writer.try_send(chunk) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(returned)) => {
+                    chunk = returned;
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(TerminalError::WriteError(format!(
+                            "本地终端无响应：子进程 {}ms 内未读取输入（可能已停止响应），本次输入已放弃",
+                            WRITE_WAIT_BUDGET.as_millis()
+                        )));
+                    }
+                    std::thread::sleep(WRITE_WAIT_POLL.min(deadline - now));
+                }
+                // The writer thread is gone (the child's stdin broke): the
+                // same Closed the old shape's broken-pipe error meant.
+                Err(TrySendError::Disconnected(_)) => return Err(TerminalError::Closed),
+            }
+        }
     }
 
     fn resize(&mut self, _rows: u16, _cols: u16) {
         // No-op by design: pipes carry no window size (see the struct docs).
+    }
+}
+
+impl Drop for PipeBackend {
+    fn drop(&mut self) {
+        // Task 43, I4 -- the Drop contract (backends/mod.rs): stop everything
+        // `start` launched.
+        // 1. Kill the child. A pipe has no master-handle close that would
+        //    signal it (the pty backends' automatic path), and relying on the
+        //    stdin EOF alone leaves a stdin-ignoring child running forever.
+        //    kill() is a quick syscall; the lock is held only for it, and the
+        //    reaper's try_wait polling never holds it long either.
+        // 2. Drop the queue's sender: the writer thread finishes its current
+        //    (possibly parked) blocking write -- kill above broke the pipe, so
+        //    that write errors out at once -- and exits.
+        // 3. The reaper (never joined from here: the UI thread must not wait
+        //    on it) observes the killed child: readers hit EOF, the join
+        //    returns, try_wait reaps. No zombie, no orphan, no UI block.
+        if let Some(child) = self.child.take() {
+            let _ = child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .kill();
+        }
+        self.writer = None;
     }
 }
 
@@ -313,5 +445,105 @@ mod tests {
         // `echo` may have exited already; a Broken pipe / Closed error there is
         // the normal race, not a failure.
         let _ = backend.write(b"exit\r");
+    }
+
+    // ---- Task 43, I4: the Drop contract + the bounded write ----
+    //
+    // backends/mod.rs's Drop contract says "Drop 时必须停止 start() 启动的一切
+    // 运行物". The pipe backend's honest-platform note ("a child that ignores
+    // stdin EOF outlives the backend") violated exactly that: Drop killed
+    // nothing, and `write` executed `write_all` on the CALLING thread -- a
+    // child that stopped reading stdin parked the UI thread on the full OS
+    // pipe forever (the SSH backend's 200 ms fix never covered this path).
+
+    /// A child that never exits and never reads stdin (the I4 fixture):
+    /// PowerShell's Start-Sleep on Windows, `sh -c sleep` elsewhere.
+    #[cfg(windows)]
+    fn never_exit_command() -> portable_pty::CommandBuilder {
+        let mut cmd = portable_pty::CommandBuilder::new("powershell.exe");
+        cmd.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 100"]);
+        cmd
+    }
+
+    #[cfg(not(windows))]
+    fn never_exit_command() -> portable_pty::CommandBuilder {
+        let mut cmd = portable_pty::CommandBuilder::new("sh");
+        cmd.args(["-c", "sleep 100"]);
+        cmd
+    }
+
+    /// I4 (a) RED: dropping the backend must terminate a stdin-ignoring,
+    /// never-exiting child. The witness is the OUTPUT channel disconnecting:
+    /// the two reader threads hold the only senders, they exit on EOF, and EOF
+    /// arrives when the OS closes the child's pipes -- i.e. when the child is
+    /// dead. With no Drop kill (the old shape), the child sleeps on and the
+    /// readers stay parked in `read`, so the channel stays connected and the
+    /// deadline fires.
+    #[test]
+    fn dropping_the_backend_kills_a_stdin_ignoring_child() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(OUTPUT_CHANNEL_CAPACITY);
+        let mut backend = PipeBackend::new(never_exit_command());
+        backend
+            .start(TerminalOutput::new_for_test(tx))
+            .expect("start the pipe backend");
+        drop(backend);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx.try_recv() {
+                // Closed = every reader thread exited = the child's pipes hit
+                // EOF = the child is gone. PASS.
+                Err(futures_channel::mpsc::TryRecvError::Closed) => return,
+                _ => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "Drop 后 10s 子进程仍在运行：忽略 stdin EOF 的子进程必须被终止\
+                         （backends/mod.rs 的 Drop 契约）"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
+
+    /// I4 (b) RED: `write` on a full stdin pipe must return within a bounded
+    /// time instead of parking the caller (the freya UI thread). The old shape
+    /// ran `write_all` on the calling thread: a child that stopped reading
+    /// stdin filled the OS pipe and the 17th 4 KiB chunk parked the UI
+    /// forever. The watchdog thread turns the park into a bounded failure.
+    #[test]
+    fn write_on_a_full_stdin_pipe_returns_bounded() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<usize>();
+        // Deliberately unjoined: on the frozen path the worker is parked
+        // forever, so this thread must never wait on it (the SSH backend
+        // freeze tests' same note).
+        let _worker = std::thread::spawn(move || {
+            let (tx, _rx) = mpsc::channel::<Vec<u8>>(OUTPUT_CHANNEL_CAPACITY);
+            let mut backend = PipeBackend::new(never_exit_command());
+            backend
+                .start(TerminalOutput::new_for_test(tx))
+                .expect("start the pipe backend");
+            let chunk = vec![b'x'; 4 * 1024];
+            let mut delivered = 0usize;
+            for _ in 0..1024 {
+                // The child never reads stdin: the OS pipe fills, then (after
+                // the fix) the bounded queue. The FIRST error is the witness
+                // point -- the loop stops there.
+                if backend.write(&chunk).is_err() {
+                    break;
+                }
+                delivered += 1;
+            }
+            let _ = done_tx.send(delivered);
+        });
+        match done_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(delivered) => assert!(
+                delivered < 1024,
+                "子进程不读 stdin，1 MiB 不可能全部送达（第 {delivered} 块后应看到有界错误）"
+            ),
+            Err(_) => panic!(
+                "stdin 管道写满后 write 无限阻塞了调用线程：旧形态在调用线程直接 \
+                 write_all，子进程不读 stdin 时 UI 线程被永久挂起"
+            ),
+        }
     }
 }
