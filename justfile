@@ -32,7 +32,11 @@ e example:
     cargo run --example {{example}}
 
 t:
-    cargo test --doc --workspace
+    # remote-asset (2026-10-30 ruling): the image_viewer URI doc example
+    # documents its own precondition ("Requires the remote-asset feature",
+    # see image_viewer.rs From<&str> impl) -- run doc tests with it enabled
+    # so that example compiles instead of failing deterministically.
+    cargo test --doc --workspace --features freya-components/remote-asset
     cargo nextest run --workspace --exclude examples --features all-tests
 
 t-layout:

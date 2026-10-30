@@ -377,6 +377,12 @@ impl TestingRunner {
         self.redraw_count.get()
     }
 
+    /// The bounds most recently emitted for this node by the accessibility
+    /// update pass. Returns `None` when the node has not been emitted yet.
+    pub fn emitted_bounds(&self, node: &TestingNode) -> Option<accesskit::Rect> {
+        self.accessibility.bounds_cache.get(&node.id).cloned()
+    }
+
     pub fn handle_events_immediately(&mut self) {
         self.runner.handle_events_immediately()
     }

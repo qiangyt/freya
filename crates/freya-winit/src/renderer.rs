@@ -129,6 +129,36 @@ impl RendererContext<'_> {
             }))
             .ok();
 
+        // task-42: the a11y bounds-sync cadence guarantee. The accessibility
+        // tree throttles its bounds-flush scan to once per
+        // BOUNDS_FLUSH_INTERVAL; a skipped scan is re-run by a LATER pass,
+        // which only exists if the runner keeps being polled. This pumper
+        // guarantees that cadence: without it, a structurally quiet UI (no
+        // invalidations, no user input) would stop arming a11y passes
+        // entirely and a pending bounds flush would never drain (the
+        // putala-desktop 2026-10-28 row-vanish family). The thread exits
+        // when the proxy is gone (app teardown).
+        {
+            let proxy = self.proxy.clone();
+            std::thread::Builder::new()
+                .name("a11y-bounds-pump".into())
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        if proxy
+                            .send_event(NativeEvent::Window(NativeWindowEvent {
+                                window_id,
+                                action: NativeWindowEventAction::PollRunner,
+                            }))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .ok();
+        }
+
         self.windows.insert(window_id, app_window);
 
         window_id

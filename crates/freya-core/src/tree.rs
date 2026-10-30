@@ -368,7 +368,18 @@ impl Tree {
                     needs_render = true;
                 }
 
-                if !needs_accessibility && (flags.intersects(DiffModifies::ACCESSIBILITY)) {
+                // LAYOUT-family flags arm the pass too (task-42): a node
+                // shifted by a sibling's size change carries no
+                // ACCESSIBILITY flag, yet its accesskit bounds are stale --
+                // the pass is where the shifted bounds get flushed.
+                if !needs_accessibility
+                    && (flags.intersects(
+                        DiffModifies::ACCESSIBILITY
+                            | DiffModifies::LAYOUT
+                            | DiffModifies::INNER_LAYOUT
+                            | DiffModifies::REORDER_LAYOUT,
+                    ))
+                {
                     needs_accessibility = true;
                 }
 
@@ -383,14 +394,64 @@ impl Tree {
 
                 if flags.contains(DiffModifies::ACCESSIBILITY) {
                     match self.accessibility_state.get_mut(&node_id) {
-                        Some(accessibility_state) => accessibility_state.update(
-                            node_id,
-                            element,
-                            &mut self.accessibility_diff,
-                            &mut self.accessibility_groups,
-                            &self.accessibility_generator,
-                        ),
+                        Some(accessibility_state) => {
+                            accessibility_state.update(
+                                node_id,
+                                element,
+                                &mut self.accessibility_diff,
+                                &mut self.accessibility_groups,
+                                &self.accessibility_generator,
+                            );
+                            // task-42: a re-derived id (positional reuse) must
+                            // carry the node's whole subtree in the SAME
+                            // update -- the consumer prunes the old id's
+                            // subtree, and a later pass re-attaching the
+                            // descendants gets skipped against the pruned
+                            // nodes (the putala-desktop 2026-10-27
+                            // active_overview row-vanish).
+                            if accessibility_state.id_rederived {
+                                accessibility_state.id_rederived = false;
+                                let mut stack =
+                                    self.children.get(&node_id).cloned().unwrap_or_default();
+                                while let Some(child) = stack.pop() {
+                                    self.accessibility_diff.add_or_update(child);
+                                    stack.extend(
+                                        self.children.get(&child).cloned().unwrap_or_default(),
+                                    );
+                                }
+                            }
+                        }
                         None => {
+                            // task-42: evict any stale state holding the same
+                            // explicit a11y id. A re-created automation element
+                            // (sections collapsing between states) hashes to the
+                            // id its previous generation still holds; leaving both
+                            // alive puts the same id under two parents in one
+                            // TreeUpdate and the consumer panics on the duplicate
+                            // child (the blocking fatal-error dialog). The old
+                            // holder re-derives a counter id (the task-32 rule,
+                            // applied eagerly so the batch stays protocol-clean
+                            // regardless of dirty-entry order).
+                            if let Some(explicit) = element.accessibility().a11y_id {
+                                let holders: Vec<NodeId> = self
+                                    .accessibility_state
+                                    .iter()
+                                    .filter(|(_, state)| state.a11y_id == explicit)
+                                    .map(|(holder_id, _)| *holder_id)
+                                    .collect();
+                                for holder in holders {
+                                    if let Some(holder_state) =
+                                        self.accessibility_state.get_mut(&holder)
+                                    {
+                                        holder_state.a11y_id =
+                                            crate::accessibility::id::AccessibilityId(
+                                                self.accessibility_generator.new_id(),
+                                            );
+                                        holder_state.a11y_id_from_element = false;
+                                        self.accessibility_diff.add_or_update(holder);
+                                    }
+                                }
+                            }
                             self.accessibility_state.insert(
                                 node_id,
                                 AccessibilityState::create(

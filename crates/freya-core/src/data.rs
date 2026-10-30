@@ -414,6 +414,10 @@ pub struct AccessibilityState {
     pub a11y_id: AccessibilityId,
     pub a11y_focusable: Focusable,
     pub a11y_member_of: Option<AccessibilityId>,
+    /// task-42: set by `update` when it re-derived the counter id (positional
+    /// reuse); the caller re-emits the subtree in the same update. Read and
+    /// reset by the tree's dirty run.
+    pub(crate) id_rederived: bool,
     /// Whether the current `a11y_id` came from the element's explicit
     /// automation id (task-32, 2026-10-24). freya's sibling diff matches
     /// keyless children positionally, so inserting a conditional child
@@ -466,6 +470,7 @@ impl AccessibilityState {
             a11y_focusable: data.a11y_focusable.clone(),
             a11y_member_of: data.builder.member_of(),
             a11y_id_from_element,
+            id_rederived: false,
         }
     }
 
@@ -494,6 +499,18 @@ impl AccessibilityState {
     ) {
         let data = element.accessibility();
 
+        // task-42 (putala-desktop 2026-10-27): ALWAYS mark the node for
+        // re-emission when its accessibility data is re-processed. The caller
+        // only invokes this under ACCESSIBILITY flags, i.e. the element's
+        // a11y data (label text, member-of, explicit id, ...) just changed --
+        // emitting is the point. The old id-change-only marking left every
+        // stable-id content change permanently invisible to the consumer:
+        // the active-overview rows collapsing between sections re-rendered
+        // with unchanged ids and never reached UIA again, and once their old
+        // section container was pruned the rows were gone for good
+        // (active_overview step 40, deterministic).
+        accessibility_diff.add_or_update(node_id);
+
         if let Some(member_of) = self.a11y_member_of
             && self.a11y_member_of != data.builder.member_of()
         {
@@ -519,6 +536,11 @@ impl AccessibilityState {
                 self.a11y_id = AccessibilityId(accessibility_generator.new_id());
                 self.a11y_id_from_element = false;
                 accessibility_diff.add_or_update(node_id);
+                // task-42: the caller must re-emit this node's whole subtree
+                // in the SAME update -- the consumer prunes the old id's
+                // subtree (the descendants ride under it), and a later pass
+                // re-attaching them gets skipped against the pruned nodes.
+                self.id_rederived = true;
             }
             None => {}
         }
