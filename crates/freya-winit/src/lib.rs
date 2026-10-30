@@ -121,6 +121,7 @@ pub fn launch(mut launch_config: LaunchConfig) {
 
     let mut renderer = WinitRenderer {
         windows: HashMap::default(),
+        a11y_pump_windows: Default::default(),
         #[cfg(feature = "tray")]
         tray: launch_config.tray,
         #[cfg(all(feature = "tray", not(target_os = "linux")))]

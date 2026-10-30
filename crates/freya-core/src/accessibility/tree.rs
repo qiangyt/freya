@@ -255,7 +255,7 @@ impl AccessibilityTree {
                 .is_none_or(|last| now.saturating_duration_since(last) >= BOUNDS_FLUSH_INTERVAL);
         if scan_due {
             self.last_bounds_flush = Some(now);
-            for (node_id, cached_bounds) in self.bounds_cache.clone().iter() {
+            for (node_id, cached_bounds) in self.bounds_cache.iter() {
                 if added_or_updated_ids.contains(node_id) {
                     continue;
                 }
@@ -1044,6 +1044,186 @@ mod tests {
             .map(|(_, node)| node)
             .expect("a content update must not leave a moved sibling at stale bounds");
         assert_eq!(b_node.bounds().expect("bounds must be set").y0, 40.0);
+    }
+
+    /// A group-member rect: an explicit automation id plus a group
+    /// membership (the `member_of` face the group focus navigation reads).
+    fn rect_with_id_in_group(id: AccessibilityId, group: AccessibilityId) -> Rc<dyn ElementExt> {
+        let mut element = RectElement::default();
+        element.accessibility.a11y_id = Some(id);
+        element.accessibility.builder.set_member_of(group);
+        Rc::new(element)
+    }
+
+    /// The cold-sibling tree: ROOT -> [a, b]. `a` is REGISTERED (state via
+    /// create, carrying its group membership); `b` exists structurally but
+    /// carries NO accessibility state yet -- the cold path the eviction arm
+    /// serves (a re-created element whose state was never created).
+    fn cold_sibling_tree(
+        a: NodeId,
+        a_element: &Rc<dyn ElementExt>,
+        b: NodeId,
+        b_element: &Rc<dyn ElementExt>,
+    ) -> Tree {
+        let mut tree = Tree::default();
+
+        let root_element: Rc<dyn ElementExt> = Rc::new(RectElement::default());
+        let root_state = AccessibilityState::create(
+            NodeId::ROOT,
+            &root_element,
+            &mut tree.accessibility_diff,
+            &tree.accessibility_generator,
+            &mut tree.accessibility_groups,
+        );
+        tree.elements.insert(NodeId::ROOT, root_element);
+        tree.accessibility_state.insert(NodeId::ROOT, root_state);
+        tree.children.insert(NodeId::ROOT, vec![a, b]);
+        tree.heights.insert(NodeId::ROOT, 0);
+        tree.layout.cache_node(NodeId::ROOT, LayoutNode::default());
+
+        let a_state = AccessibilityState::create(
+            a,
+            a_element,
+            &mut tree.accessibility_diff,
+            &tree.accessibility_generator,
+            &mut tree.accessibility_groups,
+        );
+        tree.elements.insert(a, a_element.clone());
+        tree.accessibility_state.insert(a, a_state);
+        tree.parents.insert(a, NodeId::ROOT);
+        tree.heights.insert(a, 1);
+        tree.layout.cache_node(a, LayoutNode::default());
+
+        tree.elements.insert(b, b_element.clone());
+        let b_state = AccessibilityState::create(
+            b,
+            b_element,
+            &mut tree.accessibility_diff,
+            &tree.accessibility_generator,
+            &mut tree.accessibility_groups,
+        );
+        tree.accessibility_state.insert(b, b_state);
+        tree.parents.insert(b, NodeId::ROOT);
+        tree.heights.insert(b, 1);
+        tree.layout.cache_node(b, LayoutNode::default());
+
+        tree
+    }
+
+    /// 2026-10-30 review M-1 regression: the eviction reassigns the stale
+    /// holder's explicit id to a fresh counter id, but the group list kept
+    /// the DEAD id -- group focus navigation unwraps `map.get(member)` per
+    /// entry, so a dead member id panics there. The re-derived id must keep
+    /// the membership.
+    #[test]
+    fn eviction_retires_the_stale_id_from_its_accessibility_group() {
+        use std::collections::HashMap;
+
+        use crate::{
+            runner::{
+                MutationModified,
+                Mutations,
+            },
+            tree::DiffModifies,
+        };
+
+        let a = NodeId::from(2);
+        let b = NodeId::from(3);
+        let explicit_id = AccessibilityId(0xAB12_CD34);
+        let group_id = AccessibilityId(0x77AA);
+
+        let mut tree = cold_sibling_tree(
+            a,
+            &rect_with_id_in_group(explicit_id, group_id),
+            b,
+            &rect_plain(),
+        );
+        let mut a11y_tree = AccessibilityTree::new(ACCESSIBILITY_ROOT_ID);
+        let (events_sender, _events_receiver) = futures_channel::mpsc::unbounded();
+        let _ = a11y_tree.process_updates(&mut tree, &events_sender);
+
+        assert_eq!(
+            tree.accessibility_groups.get(&group_id).map(Vec::as_slice),
+            Some(&[explicit_id][..]),
+            "precondition: the member's explicit id is registered in its group"
+        );
+
+        // Enter the cold window: b's state is dropped (the structural node
+        // outlives its state), so the next ACCESSIBILITY mutation on b takes
+        // the creation arm the eviction serves.
+        tree.accessibility_state.remove(&b);
+
+        // b re-creates claiming the SAME explicit id -> the cold-path arm
+        // evicts a's hold on it.
+        tree.apply_mutations(Mutations {
+            added: vec![],
+            modified: vec![MutationModified {
+                node_id: b,
+                element: rect_with_id(explicit_id),
+                flags: DiffModifies::ACCESSIBILITY,
+            }],
+            removed: vec![],
+            moved: HashMap::default(),
+        });
+        let _ = a11y_tree.process_updates(&mut tree, &events_sender);
+
+        let a_new_id = tree.accessibility_state.get(&a).unwrap().a11y_id;
+        assert_ne!(
+            a_new_id, explicit_id,
+            "precondition: the eviction re-derived a's id"
+        );
+        let members = tree
+            .accessibility_groups
+            .get(&group_id)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !members.contains(&explicit_id),
+            "the evicted id must leave its group list (a dead member id panics group focus navigation): {members:?}"
+        );
+        assert!(
+            members.contains(&a_new_id),
+            "the re-derived id keeps the membership: {members:?}"
+        );
+    }
+
+    /// 2026-10-30 review M-2 regression: a re-created element claiming the
+    /// RESERVED root id (0) must not evict the ROOT state -- the eviction
+    /// would reassign ROOT's id while `TreeUpdate::tree` still declares 0 as
+    /// the root, desyncing the protocol.
+    #[test]
+    fn eviction_never_reassigns_the_root_id() {
+        use std::collections::HashMap;
+
+        use crate::{
+            runner::{
+                MutationModified,
+                Mutations,
+            },
+            tree::DiffModifies,
+        };
+
+        let a = NodeId::from(2);
+        let b = NodeId::from(3);
+
+        let mut tree = cold_sibling_tree(a, &rect_plain(), b, &rect_plain());
+
+        tree.apply_mutations(Mutations {
+            added: vec![],
+            modified: vec![MutationModified {
+                node_id: b,
+                element: rect_with_id(ACCESSIBILITY_ROOT_ID),
+                flags: DiffModifies::ACCESSIBILITY,
+            }],
+            removed: vec![],
+            moved: HashMap::default(),
+        });
+
+        assert_eq!(
+            tree.accessibility_state.get(&NodeId::ROOT).unwrap().a11y_id,
+            ACCESSIBILITY_ROOT_ID,
+            "a re-created element claiming the reserved root id must not reassign ROOT's id"
+        );
     }
 
     /// task-42 gating half: a LAYOUT-only mutation (no ACCESSIBILITY flag)

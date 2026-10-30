@@ -21,7 +21,10 @@ use ragnarok::{
     EventsExecutorRunner,
     EventsMeasurerRunner,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{
+    FxHashMap,
+    FxHashSet,
+};
 use torin::prelude::{
     CursorPoint,
     Size2D,
@@ -85,6 +88,9 @@ pub struct WinitRenderer {
     pub(crate) tray_icon: Option<TrayIcon>,
     pub resumed: bool,
     pub windows: FxHashMap<WindowId, AppWindow>,
+    /// The window ids that already own an a11y bounds pumper (the creation
+    /// paths are four; the guard keeps the pump one-per-window).
+    pub a11y_pump_windows: FxHashSet<WindowId>,
     pub proxy: EventLoopProxy<NativeEvent>,
     pub plugins: PluginsManager,
     pub fallback_fonts: Vec<Cow<'static, str>>,
@@ -105,6 +111,62 @@ pub struct RendererContext<'a> {
     pub font_collection: &'a mut FontCollection,
     pub active_event_loop: &'a ActiveEventLoop,
     pub gpu_resource_cache_limit: usize,
+    pub a11y_pump_windows: &'a mut FxHashSet<WindowId>,
+}
+
+/// The pumper cadence: must stay within `BOUNDS_FLUSH_INTERVAL` (the
+/// freya-core accessibility tree's throttle) so a throttled bounds flush is
+/// drained at most one interval late. Keep the two values in sync (see
+/// freya-core `accessibility/tree.rs`).
+const A11Y_BOUNDS_PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// task-42: the a11y bounds-sync cadence guarantee. The accessibility tree
+/// throttles its bounds-flush scan to once per `BOUNDS_FLUSH_INTERVAL`; a
+/// skipped scan is re-run by a LATER pass, which only exists if the runner
+/// keeps being polled. This pumper guarantees that cadence: without it, a
+/// structurally quiet UI (no invalidations, no user input) would stop arming
+/// a11y passes entirely and a pending bounds flush would never drain (the
+/// putala-desktop 2026-10-28 row-vanish family). The thread exits when the
+/// proxy is gone (app teardown).
+///
+/// Spawned from EVERY window-creation path (the `resumed()` first-window
+/// drain, the tray `LaunchWindow`, the runtime `launch_window` extension,
+/// and the erased `Platform::launch_window` async API arm)
+/// -- the main window is created through `resumed()`, so wiring the pump only
+/// in `launch_window` left it without the cadence guarantee (the 2026-10-30
+/// pre-commit review). `pumped` keeps the pump one-per-window across the
+/// paths; Android is skipped because its foreground recreate mints a fresh
+/// window id per event (a pump per recreate would leak threads) and the
+/// recreate path already sends `PollRunner` itself.
+fn spawn_a11y_bounds_pump(
+    pumped: &mut FxHashSet<WindowId>,
+    proxy: &EventLoopProxy<NativeEvent>,
+    window_id: WindowId,
+) {
+    if cfg!(target_os = "android") {
+        return;
+    }
+    if !pumped.insert(window_id) {
+        return;
+    }
+    let proxy = proxy.clone();
+    std::thread::Builder::new()
+        .name("a11y-bounds-pump".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(A11Y_BOUNDS_PUMP_INTERVAL);
+                if proxy
+                    .send_event(NativeEvent::Window(NativeWindowEvent {
+                        window_id,
+                        action: NativeWindowEventAction::PollRunner,
+                    }))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .ok();
 }
 
 impl RendererContext<'_> {
@@ -129,35 +191,9 @@ impl RendererContext<'_> {
             }))
             .ok();
 
-        // task-42: the a11y bounds-sync cadence guarantee. The accessibility
-        // tree throttles its bounds-flush scan to once per
-        // BOUNDS_FLUSH_INTERVAL; a skipped scan is re-run by a LATER pass,
-        // which only exists if the runner keeps being polled. This pumper
-        // guarantees that cadence: without it, a structurally quiet UI (no
-        // invalidations, no user input) would stop arming a11y passes
-        // entirely and a pending bounds flush would never drain (the
-        // putala-desktop 2026-10-28 row-vanish family). The thread exits
-        // when the proxy is gone (app teardown).
-        {
-            let proxy = self.proxy.clone();
-            std::thread::Builder::new()
-                .name("a11y-bounds-pump".into())
-                .spawn(move || {
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_millis(150));
-                        if proxy
-                            .send_event(NativeEvent::Window(NativeWindowEvent {
-                                window_id,
-                                action: NativeWindowEventAction::PollRunner,
-                            }))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                })
-                .ok();
-        }
+        // task-42: the a11y bounds-sync cadence guarantee (see
+        // `spawn_a11y_bounds_pump`); wired on every creation path.
+        spawn_a11y_bounds_pump(self.a11y_pump_windows, self.proxy, window_id);
 
         self.windows.insert(window_id, app_window);
 
@@ -320,14 +356,20 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                     self.gpu_resource_cache_limit,
                 );
 
+                let window_id = app_window.window.id();
+
                 self.proxy
                     .send_event(NativeEvent::Window(NativeWindowEvent {
-                        window_id: app_window.window.id(),
+                        window_id,
                         action: NativeWindowEventAction::PollRunner,
                     }))
                     .ok();
 
-                self.windows.insert(app_window.window.id(), app_window);
+                // The main-window creation path: wire the a11y bounds pumper
+                // here too (see `spawn_a11y_bounds_pump`).
+                spawn_a11y_bounds_pump(&mut self.a11y_pump_windows, &self.proxy, window_id);
+
+                self.windows.insert(window_id, app_window);
             }
             self.resumed = true;
 
@@ -381,6 +423,7 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                     font_manager: &mut self.font_manager,
                     font_collection: &mut self.font_collection,
                     gpu_resource_cache_limit: self.gpu_resource_cache_limit,
+                    a11y_pump_windows: &mut self.a11y_pump_windows,
                 };
                 (cb)(&mut renderer_context);
             }
@@ -407,6 +450,7 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                     font_manager: &mut self.font_manager,
                     font_collection: &mut self.font_collection,
                     gpu_resource_cache_limit: self.gpu_resource_cache_limit,
+                    a11y_pump_windows: &mut self.a11y_pump_windows,
                 };
                 match action {
                     NativeTrayEventAction::TrayEvent(icon_event) => {
@@ -437,14 +481,18 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                             self.gpu_resource_cache_limit,
                         );
 
+                        let window_id = app_window.window.id();
+
                         self.proxy
                             .send_event(NativeEvent::Window(NativeWindowEvent {
-                                window_id: app_window.window.id(),
+                                window_id,
                                 action: NativeWindowEventAction::PollRunner,
                             }))
                             .ok();
 
-                        self.windows.insert(app_window.window.id(), app_window);
+                        spawn_a11y_bounds_pump(&mut self.a11y_pump_windows, &self.proxy, window_id);
+
+                        self.windows.insert(window_id, app_window);
                     }
                 }
             }
@@ -604,6 +652,12 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                                             },
                                         ));
 
+                                        spawn_a11y_bounds_pump(
+                                            &mut self.a11y_pump_windows,
+                                            &self.proxy,
+                                            window_id,
+                                        );
+
                                         self.windows.insert(window_id, app_window);
                                         let _ = ack.send(window_id);
                                     }
@@ -639,6 +693,7 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                                             font_manager: &mut self.font_manager,
                                             font_collection: &mut self.font_collection,
                                             gpu_resource_cache_limit: self.gpu_resource_cache_limit,
+                                            a11y_pump_windows: &mut self.a11y_pump_windows,
                                         };
                                         (cb)(window_id, &mut renderer_context);
                                     }
@@ -703,6 +758,7 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                             font_manager: &mut self.font_manager,
                             font_collection: &mut self.font_collection,
                             gpu_resource_cache_limit: self.gpu_resource_cache_limit,
+                            a11y_pump_windows: &mut self.a11y_pump_windows,
                         };
                         on_close(renderer_context, window_id)
                     } else {

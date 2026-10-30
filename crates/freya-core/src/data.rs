@@ -533,6 +533,17 @@ impl AccessibilityState {
             // accesskit NodeId in the same tree update, which
             // accesskit_consumer rejects with a panic.
             None if self.a11y_id_from_element && node_id != NodeId::ROOT => {
+                // Retire the old id from its group list first (the list holds
+                // raw ids and group focus navigation unwraps map lookups per
+                // member -- a dead id panics there); the re-derived id
+                // re-joins below through the member_of push when the
+                // membership survives the reuse (2026-10-30 review M-1, the
+                // data-side sibling of the eviction fix).
+                if let Some(member_of) = self.a11y_member_of
+                    && let Some(group) = accessibility_groups.get_mut(&member_of)
+                {
+                    group.retain(|id| *id != self.a11y_id);
+                }
                 self.a11y_id = AccessibilityId(accessibility_generator.new_id());
                 self.a11y_id_from_element = false;
                 accessibility_diff.add_or_update(node_id);
@@ -619,6 +630,55 @@ mod tests {
         let derived = state.a11y_id;
         state.update(node, &plain, &mut diff, &mut groups, &generator);
         assert_eq!(state.a11y_id, derived);
+    }
+
+    /// A group-member rect with no explicit id (the rederivation face that
+    /// KEEPS its group membership).
+    fn rect_in_group(group: AccessibilityId) -> Rc<dyn ElementExt> {
+        let mut element = RectElement::default();
+        element.accessibility.builder.set_member_of(group);
+        Rc::new(element)
+    }
+
+    /// 2026-10-30 review M-1 (the data-side sibling of the eviction gap):
+    /// when `update` re-derives the id (the element lost its explicit id but
+    /// keeps the group membership), the group list must retire the OLD id --
+    /// it currently keeps both, and the dead one panics group focus
+    /// navigation.
+    #[test]
+    fn update_rederivation_retires_the_stale_group_id() {
+        let generator = AccessibilityGenerator::default();
+        let mut diff = AccessibilityDirtyNodes::default();
+        let mut groups = AccessibilityGroups::default();
+        let node = NodeId::PLACEHOLDER;
+        let group = AccessibilityId(0x5C);
+
+        let mut tagged_rect = RectElement::default();
+        tagged_rect.accessibility.a11y_id = Some(AccessibilityId(0xD1CE));
+        tagged_rect.accessibility.builder.set_member_of(group);
+        let tagged: Rc<dyn ElementExt> = Rc::new(tagged_rect);
+        let mut state =
+            AccessibilityState::create(node, &tagged, &mut diff, &generator, &mut groups);
+        assert_eq!(
+            groups.get(&group).map(Vec::as_slice),
+            Some(&[AccessibilityId(0xD1CE)][..]),
+            "precondition: the explicit id is registered in the group"
+        );
+
+        let member = rect_in_group(group);
+        state.update(node, &member, &mut diff, &mut groups, &generator);
+        let rederived = state.a11y_id;
+        assert_ne!(rederived, AccessibilityId(0xD1CE));
+
+        let members = groups.get(&group).cloned().unwrap_or_default();
+        assert!(
+            !members.contains(&AccessibilityId(0xD1CE)),
+            "the re-derived-away id must leave the group list (a dead member id panics group focus navigation): {members:?}"
+        );
+        assert!(
+            members.contains(&rederived),
+            "the re-derived id keeps the membership: {members:?}"
+        );
     }
 
     /// The everyday path must not churn: a stable explicit id survives

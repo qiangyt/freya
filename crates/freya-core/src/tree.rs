@@ -432,7 +432,13 @@ impl Tree {
                             // holder re-derives a counter id (the task-32 rule,
                             // applied eagerly so the batch stays protocol-clean
                             // regardless of dirty-entry order).
-                            if let Some(explicit) = element.accessibility().a11y_id {
+                            // Never evict the ROOT state: a re-created element
+                            // claiming the reserved root id would reassign
+                            // ROOT while `TreeUpdate::tree` still declares it
+                            // -- protocol desync (2026-10-30 review M-2).
+                            if let Some(explicit) = element.accessibility().a11y_id
+                                && explicit != crate::accessibility::tree::ACCESSIBILITY_ROOT_ID
+                            {
                                 let holders: Vec<NodeId> = self
                                     .accessibility_state
                                     .iter()
@@ -443,10 +449,24 @@ impl Tree {
                                     if let Some(holder_state) =
                                         self.accessibility_state.get_mut(&holder)
                                     {
-                                        holder_state.a11y_id =
-                                            crate::accessibility::id::AccessibilityId(
-                                                self.accessibility_generator.new_id(),
-                                            );
+                                        let rederived = crate::accessibility::id::AccessibilityId(
+                                            self.accessibility_generator.new_id(),
+                                        );
+                                        // Retire the stale id from its group
+                                        // list (the list holds raw ids and
+                                        // group focus navigation unwraps map
+                                        // lookups per member -- a dead id
+                                        // panics there); the re-derived id
+                                        // keeps the membership (2026-10-30
+                                        // review M-1).
+                                        if let Some(member_of) = holder_state.a11y_member_of
+                                            && let Some(group) =
+                                                self.accessibility_groups.get_mut(&member_of)
+                                        {
+                                            group.retain(|id| *id != explicit);
+                                            group.push(rederived);
+                                        }
+                                        holder_state.a11y_id = rederived;
                                         holder_state.a11y_id_from_element = false;
                                         self.accessibility_diff.add_or_update(holder);
                                     }
