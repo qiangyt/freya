@@ -79,8 +79,6 @@ pub struct AccessibilityTree {
     /// close button ~580px to the right, so the UIA click landed on the tab
     /// body). Reset by the scan that consumes it.
     force_next_bounds_scan: bool,
-    /// TEMP-DEBUG (row-vanish forensics; REVERT AFTER USE): pass sequence.
-    pass_seq: u64,
 }
 
 /// The bounds-sync throttle window. Bounds only need "eventually correct"
@@ -115,7 +113,6 @@ impl AccessibilityTree {
             bounds_cache: FxHashMap::default(),
             last_bounds_flush: None,
             force_next_bounds_scan: false,
-            pass_seq: 0,
         }
     }
 
@@ -138,35 +135,15 @@ impl AccessibilityTree {
 
         let mut nodes = vec![];
 
-        let mut init_ids: Vec<u64> = Vec::new();
         tree.traverse_depth(|node_id| {
             let accessibility_state = tree.accessibility_state.get(&node_id).unwrap();
             let layout_node = tree.layout.get(&node_id).unwrap();
             let accessibility_node = Self::create_node(node_id, layout_node, tree);
             self.bounds_cache
                 .insert(node_id, layout_area_to_rect(layout_node));
-            init_ids.push(accessibility_state.a11y_id.0);
             nodes.push((accessibility_state.a11y_id, accessibility_node));
             self.map.insert(accessibility_state.a11y_id, node_id);
         });
-        // TEMP-DEBUG (row-vanish forensics; REVERT AFTER USE)
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("C:/putala-workspace/putala-desktop/.superpowers/sdd/a11y-trace.log")
-        {
-            use std::{
-                fmt::Write as _,
-                io::Write as _,
-            };
-            let mut line = String::new();
-            let _ = write!(line, "INIT n={} ids[", init_ids.len());
-            for id in &init_ids {
-                let _ = write!(line, "{id},");
-            }
-            let _ = writeln!(line, "]");
-            let _ = f.write_all(line.as_bytes());
-        }
 
         #[cfg(debug_assertions)]
         tracing::info!(
@@ -360,45 +337,13 @@ impl AccessibilityTree {
 
         // Create the updated nodes
         let mut nodes = Vec::new();
-        let mut emitted_trace = String::new();
         for node_id in added_or_updated_ids {
             let accessibility_state = tree.accessibility_state.get(&node_id).unwrap();
             let layout_node = tree.layout.get(&node_id).unwrap();
             let accessibility_node = Self::create_node(node_id, layout_node, tree);
             self.bounds_cache
                 .insert(node_id, layout_area_to_rect(layout_node));
-            // TEMP-DEBUG (row-vanish forensics; REVERT AFTER USE)
-            {
-                use std::fmt::Write as _;
-                let _ = write!(emitted_trace, "{},", accessibility_state.a11y_id.0);
-                let mut child_ids = String::new();
-                if let Some(children) = tree.children.get(&node_id) {
-                    for child in children {
-                        if let Some(child_state) = tree.accessibility_state.get(child) {
-                            let _ = write!(child_ids, "{},", child_state.a11y_id.0);
-                        }
-                    }
-                }
-                if !child_ids.is_empty() {
-                    let _ = write!(
-                        emitted_trace,
-                        "@parent_of[{}]",
-                        child_ids.trim_end_matches(',')
-                    );
-                }
-            }
             nodes.push((accessibility_state.a11y_id, accessibility_node));
-        }
-        // TEMP-DEBUG (row-vanish forensics; REVERT AFTER USE)
-        if !emitted_trace.is_empty()
-            && let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("C:/putala-workspace/putala-desktop/.superpowers/sdd/a11y-trace.log")
-        {
-            use std::io::Write as _;
-            self.pass_seq += 1;
-            let _ = writeln!(f, "EMIT {} [{}]", self.pass_seq, emitted_trace);
         }
 
         let has_request_focus = requested_focus.is_some();
