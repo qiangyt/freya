@@ -71,6 +71,16 @@ pub fn launch(mut launch_config: LaunchConfig) {
             // UI state borrow panic, 2026-10-24). Log the panic through the
             // normal subscriber first, then keep the dialog face.
             tracing::error!("PANIC: {panic_info}");
+            // Diagnostic face (kept deliberately, 2026-10-31): the rfd dialog
+            // below BLOCKS the thread, so `previous_hook` (the default hook that
+            // would print the backtrace to stderr) never runs -- in a release
+            // build a panic therefore used to surface as one location+message
+            // line with no stack at all. Emit the backtrace through the normal
+            // subscriber BEFORE the dialog, so release panics are diagnosable
+            // from the log alone (this is how the home_shell borrow-conflict
+            // panic was root-caused). Zero cost on the non-panic path; requires
+            // a symbol-bearing binary for the frames to resolve to fn:line.
+            tracing::error!("PANIC BACKTRACE:\n{}", std::backtrace::Backtrace::force_capture());
             rfd::MessageDialog::new()
                 .set_title("Fatal Error")
                 .set_description(&panic_info.to_string())
