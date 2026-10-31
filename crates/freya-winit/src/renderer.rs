@@ -569,6 +569,18 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                                 app.window.request_redraw();
                             }
                             if result.needs_accessibility {
+                                // A LAYOUT mutation also sets needs_accessibility
+                                // (tree.rs's layout_only_mutations_flag_accessibility),
+                                // and a layout-only mover (a tab's title widening and
+                                // pushing its trailing close button right) carries no
+                                // accessibility-diff mark -- so the bounds-sync scan
+                                // would otherwise be throttled away and serve stale
+                                // geometry until a later pass that a quiet UI never
+                                // produces. Arm the scan so this frame's movers are
+                                // re-emitted immediately (the terminal close-button
+                                // defect: the a11y rect stayed at the narrow-tab
+                                // position, so the UIA click hit the tab body).
+                                app.accessibility.arm_bounds_scan();
                                 app.accessibility_tasks_for_next_render |=
                                     AccessibilityTask::ProcessUpdate { mode: None };
                                 app.window.request_redraw();

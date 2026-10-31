@@ -67,6 +67,18 @@ pub struct AccessibilityTree {
     /// is safe here: a skipped scan is re-run by a pass at most one interval
     /// later -- it is never lost.
     last_bounds_flush: Option<std::time::Instant>,
+    /// Set by the host when a frame carried an actual tree change (a LAYOUT or
+    /// ACCESSIBILITY mutation). Such a frame must synchronize the moved bounds
+    /// IMMEDIATELY, not wait for the throttle: a layout-only change (e.g. a
+    /// terminal tab's title widening and pushing its trailing close button
+    /// right) produces NO accessibility-diff mark, so without this override the
+    /// scan is throttled away and the moved node's stale bounds are served to
+    /// AT/UIA until some later pass happens to re-scan -- which a structurally
+    /// quiet UI never does (the putala-desktop terminal close-button defect:
+    /// the a11y rect kept the narrow-tab position while the real layout had the
+    /// close button ~580px to the right, so the UIA click landed on the tab
+    /// body). Reset by the scan that consumes it.
+    force_next_bounds_scan: bool,
     /// TEMP-DEBUG (row-vanish forensics; REVERT AFTER USE): pass sequence.
     pass_seq: u64,
 }
@@ -102,8 +114,18 @@ impl AccessibilityTree {
             map: FxHashMap::default(),
             bounds_cache: FxHashMap::default(),
             last_bounds_flush: None,
+            force_next_bounds_scan: false,
             pass_seq: 0,
         }
+    }
+
+    /// Arm the bounds-sync scan for the next pass: the host calls this when a
+    /// frame carried an actual tree change (LAYOUT or ACCESSIBILITY mutation),
+    /// so a layout-only mover (a node that SHIFTED without an accessibility-diff
+    /// mark) is re-emitted with fresh bounds immediately instead of being
+    /// throttled away. See the `force_next_bounds_scan` field.
+    pub fn arm_bounds_scan(&mut self) {
+        self.force_next_bounds_scan = true;
     }
 
     pub fn focused_node_id(&self) -> Option<NodeId> {
@@ -247,9 +269,15 @@ impl AccessibilityTree {
         // price of correct AT geometry.
         // Throttled: idle periodic scans may be deferred, but frames with actual
         // changes must synchronize bounds immediately because a click can arrive
-        // before the next periodic scan.
+        // before the next periodic scan. `force_next_bounds_scan` is the host's
+        // "this frame carried a LAYOUT or ACCESSIBILITY mutation" signal: a
+        // layout-only mover carries no diff mark (has_changes stays false), so
+        // without it the throttle would swallow the mover on a quiet UI that
+        // never re-scans (the terminal close-button defect).
         let has_changes = !removed_ids.is_empty() || !added_or_updated_ids.is_empty();
+        let forced = std::mem::take(&mut self.force_next_bounds_scan);
         let scan_due = has_changes
+            || forced
             || self
                 .last_bounds_flush
                 .is_none_or(|last| now.saturating_duration_since(last) >= BOUNDS_FLUSH_INTERVAL);
@@ -1258,6 +1286,90 @@ mod tests {
         assert!(
             result.needs_accessibility,
             "LAYOUT-only mutations must arm the accessibility pass (the bounds flush rides it)"
+        );
+    }
+
+    /// The putala-desktop terminal close-button defect (2026-10-31): a LAYOUT-only
+    /// mover -- a node that SHIFTED because a sibling grew, carrying NO
+    /// accessibility-diff mark -- was throttled away and never re-emitted, so the
+    /// a11y tree kept serving yesterday's geometry (the tab's trailing close
+    /// button stayed at the narrow-tab position while the real layout had it
+    /// ~580px right; the UIA click landed on the tab body). The fix arms the scan
+    /// (`arm_bounds_scan`) when a frame carries a LAYOUT or ACCESSIBILITY
+    /// mutation, so the mover is flushed even inside the throttle window. This
+    /// test pins BOTH halves: un-armed inside the window the mover is deferred
+    /// (the defect shape), armed it is re-emitted with fresh bounds.
+    #[test]
+    fn armed_scan_flushes_a_layout_only_mover_inside_the_throttle_window() {
+        let a = NodeId::from(2);
+        let b = NodeId::from(3);
+        let mut tree = stacked_tree(
+            a,
+            b,
+            Area::new(Point2D::new(0.0, 0.0), Size2D::new(100.0, 20.0)),
+            Area::new(Point2D::new(0.0, 20.0), Size2D::new(100.0, 20.0)),
+        );
+        let mut a11y_tree = AccessibilityTree::new(ACCESSIBILITY_ROOT_ID);
+        let (events_sender, _events_receiver) = futures_channel::mpsc::unbounded();
+        a11y_tree.init(&mut tree);
+
+        let base = std::time::Instant::now();
+        // First pass: the initial scan runs (last_bounds_flush is None) and
+        // records the flush time; B's bounds are cached at y0=20.
+        a11y_tree.process_updates_at(&mut tree, &events_sender, base);
+        let b_id = tree.accessibility_state.get(&b).unwrap().a11y_id;
+        assert_eq!(
+            a11y_tree.bounds_cache.get(&b).map(|rect| rect.y0),
+            Some(20.0)
+        );
+
+        // A grows, B shifts down. NO accessibility-diff mark (a pure layout move),
+        // exactly the shape a widening tab title produces for its close button.
+        tree.layout.cache_node(
+            a,
+            LayoutNode {
+                area: Area::new(Point2D::new(0.0, 0.0), Size2D::new(100.0, 40.0)),
+                ..Default::default()
+            },
+        );
+        tree.layout.cache_node(
+            b,
+            LayoutNode {
+                area: Area::new(Point2D::new(0.0, 40.0), Size2D::new(100.0, 20.0)),
+                ..Default::default()
+            },
+        );
+
+        // Inside the throttle window (10ms < 150ms) and UN-armed: the scan is
+        // deferred, so B is not re-emitted -- its stale bounds survive (defect).
+        let update = a11y_tree.process_updates_at(
+            &mut tree,
+            &events_sender,
+            base + std::time::Duration::from_millis(10),
+        );
+        assert!(
+            update.nodes.iter().all(|(id, _)| *id != b_id),
+            "un-armed inside the throttle window, a layout-only mover is deferred \
+             (its stale bounds survive -- the defect shape)"
+        );
+
+        // The host arms the scan (the frame carried a LAYOUT mutation). The very
+        // next pass, still inside the window, must re-emit B with fresh bounds.
+        a11y_tree.arm_bounds_scan();
+        let update = a11y_tree.process_updates_at(
+            &mut tree,
+            &events_sender,
+            base + std::time::Duration::from_millis(20),
+        );
+        let b_bounds = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == b_id)
+            .map(|(_, node)| node.bounds().expect("bounds must be set"))
+            .expect("an armed pass must re-emit the layout-only mover with fresh bounds");
+        assert_eq!(
+            b_bounds.y0, 40.0,
+            "the armed scan must flush B's moved bounds (y0=40), not the stale y0=20"
         );
     }
 }

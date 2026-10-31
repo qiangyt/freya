@@ -431,6 +431,13 @@ impl TestingRunner {
                 ..count
             });
         }
+        // Mirror freya-winit's PollRunner: a frame that carried a LAYOUT or
+        // ACCESSIBILITY mutation arms the bounds-sync scan so a layout-only
+        // mover is re-emitted with fresh bounds immediately (not throttled
+        // away) -- the terminal close-button defect's fix.
+        if result.needs_accessibility {
+            self.accessibility.arm_bounds_scan();
+        }
         self.tree.borrow_mut().measure_layout(
             self.size,
             &mut self.font_collection,
