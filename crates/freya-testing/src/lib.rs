@@ -383,6 +383,57 @@ impl TestingRunner {
         self.accessibility.bounds_cache.get(&node.id).cloned()
     }
 
+    /// Resize the headless window: the faithful mirror of freya-winit's
+    /// `WindowEvent::Resized` -> `RedrawRequested` sequence (renderer.rs).
+    ///
+    /// winit semantics being mirrored, step by step:
+    /// 1. `Resized`: force a full re-layout on the new size
+    ///    (`layout.clear_dirty()` + `layout.invalidate(NodeId::ROOT)`),
+    /// 2. arm the bounds-sync scan and queue the accessibility pass (the
+    ///    layout-shift fix: a resize frame carries no mutation, so without
+    ///    this the consumer keeps serving the pre-resize geometry until the
+    ///    next mutation frame -- measured as a ~12s freeze on the
+    ///    putala-desktop probe, a 140ms mixed-generation window headless),
+    /// 3. `RedrawRequested`: `measure_layout` on the new size, then run the
+    ///    queued accessibility pass in the same frame (freya-testing has no
+    ///    task queue to park it in, so "queued" and "run" are the same call --
+    ///    in winit the task sits in `accessibility_tasks_for_next_render`
+    ///    until the redraw takes it).
+    ///
+    /// After this call returns, every mover's fresh bounds are already
+    /// emitted to the consumer (see [`TestingRunner::emitted_bounds`]).
+    pub fn resize(&mut self, size: Size2D) {
+        self.size = size;
+        {
+            let mut tree = self.tree.borrow_mut();
+            tree.layout.clear_dirty();
+            tree.layout.invalidate(NodeId::ROOT);
+        }
+        self.accessibility.arm_bounds_scan();
+        self.tree.borrow_mut().measure_layout(
+            self.size,
+            &mut self.font_collection,
+            &self.font_manager,
+            &self.events_sender,
+            self.scale_factor,
+            &self.default_fonts,
+        );
+        // Same tail as `sync_and_update` (and winit's `AccessibilityTask::
+        // ProcessUpdate` arm): publish the focused node / IME cursor area.
+        let accessibility_update = self
+            .accessibility
+            .process_updates(&mut self.tree.borrow_mut(), &self.events_sender);
+        self.platform
+            .focused_accessibility_id
+            .set_if_modified(accessibility_update.focus);
+        let node_id = self.accessibility.focused_node_id().unwrap();
+        let tree = self.tree.borrow();
+        let layout_node = tree.layout.get(&node_id).unwrap();
+        self.platform
+            .focused_accessibility_node
+            .set_if_modified(AccessibilityTree::create_node(node_id, layout_node, &tree));
+    }
+
     pub fn handle_events_immediately(&mut self) {
         self.runner.handle_events_immediately()
     }

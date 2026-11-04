@@ -80,7 +80,10 @@ pub fn launch(mut launch_config: LaunchConfig) {
             // from the log alone (this is how the home_shell borrow-conflict
             // panic was root-caused). Zero cost on the non-panic path; requires
             // a symbol-bearing binary for the frames to resolve to fn:line.
-            tracing::error!("PANIC BACKTRACE:\n{}", std::backtrace::Backtrace::force_capture());
+            tracing::error!(
+                "PANIC BACKTRACE:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
             rfd::MessageDialog::new()
                 .set_title("Fatal Error")
                 .set_description(&panic_info.to_string())

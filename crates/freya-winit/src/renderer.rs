@@ -753,6 +753,17 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                     app.process_layout_on_next_render = true;
                     app.tree.layout.reset();
                     app.tree.text_cache.reset();
+                    // A DPI change re-layouts every node, but carries NO
+                    // mutation -- so without arming, the bounds-sync scan is
+                    // throttled/deferred (a quiet UI may never produce the
+                    // pass that re-emits the fresh geometry; the probe
+                    // measured ~12s of stale consumer bounds after a resize).
+                    // Same arm as the mutation frame above: this frame's
+                    // RedrawRequested measures first, then runs the queued
+                    // pass, so emission reads this frame's fresh coordinates.
+                    app.accessibility.arm_bounds_scan();
+                    app.accessibility_tasks_for_next_render |=
+                        AccessibilityTask::ProcessUpdate { mode: None };
                 }
                 WindowEvent::CloseRequested => {
                     let mut on_close_hook = self
@@ -994,6 +1005,18 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                     app.process_layout_on_next_render = true;
                     app.tree.layout.clear_dirty();
                     app.tree.layout.invalidate(NodeId::ROOT);
+                    // A resize re-layouts every node, but carries NO mutation
+                    // -- so without arming, the bounds-sync scan is throttled
+                    // or (on a quiet UI) deferred until the next mutation
+                    // frame, leaving the consumer stuck on pre-resize
+                    // geometry (probe: ~12s frozen; clicks land on where the
+                    // row USED to be). Same arm as the mutation frame:
+                    // this frame's RedrawRequested measures first, then runs
+                    // the queued pass, so emission reads this frame's fresh
+                    // coordinates.
+                    app.accessibility.arm_bounds_scan();
+                    app.accessibility_tasks_for_next_render |=
+                        AccessibilityTask::ProcessUpdate { mode: None };
                 }
 
                 WindowEvent::MouseInput { state, button, .. } => {
