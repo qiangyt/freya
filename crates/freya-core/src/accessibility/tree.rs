@@ -1318,3 +1318,8 @@ mod tests {
         );
     }
 }
+
+// P3-1 第五形态取证实验模块（2026-11-04 主会话审查通过，收编为机制契约钉；
+// 修复面红绿测试在 freya-testing tests/a11y_resize_bounds_sync.rs）。
+#[cfg(test)]
+mod tree_forensics_tests;
