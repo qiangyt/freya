@@ -52,7 +52,10 @@ use winit::{
 };
 
 use crate::{
-    accessibility::AccessibilityTask,
+    accessibility::{
+        AccessibilityTask,
+        on_layout_only_change,
+    },
     config::{
         OnCloseHook,
         WindowConfig,
@@ -412,8 +415,7 @@ impl AppWindow {
         // arming, the bounds-sync scan is throttled or deferred and the
         // consumer keeps the pre-zoom geometry until a later mutation
         // frame. Arm so this frame's pass re-emits the fresh coordinates.
-        self.accessibility.arm_bounds_scan();
-        self.accessibility_tasks_for_next_render |= AccessibilityTask::ProcessUpdate { mode: None };
+        self.accessibility_tasks_for_next_render |= on_layout_only_change(&mut self.accessibility);
         self.window.request_redraw();
     }
 

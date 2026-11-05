@@ -5,4 +5,5 @@ pub mod focusable;
 pub mod groups;
 pub mod id;
 pub mod screen_reader;
+pub mod task;
 pub mod tree;

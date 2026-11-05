@@ -1,27 +1,8 @@
-use std::{
-    mem,
-    ops::BitOrAssign,
+// `AccessibilityTask` lives in freya-core (next to the shared
+// layout-only-change decision, `on_layout_only_change`); this module
+// re-exports it so the crate-internal `use crate::accessibility::...`
+// paths keep working.
+pub use freya_core::accessibility::task::{
+    AccessibilityTask,
+    on_layout_only_change,
 };
-
-use freya_core::prelude::NavigationMode;
-
-#[derive(Hash, PartialEq, Eq)]
-pub enum AccessibilityTask {
-    Init,
-    ProcessUpdate { mode: Option<NavigationMode> },
-    None,
-}
-
-impl AccessibilityTask {
-    pub fn take(&mut self) -> Self {
-        mem::replace(self, Self::None)
-    }
-}
-
-impl BitOrAssign for AccessibilityTask {
-    fn bitor_assign(&mut self, rhs: Self) {
-        if self == &Self::None {
-            *self = rhs
-        }
-    }
-}

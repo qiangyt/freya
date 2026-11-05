@@ -78,7 +78,7 @@ pub struct AccessibilityTree {
     /// the a11y rect kept the narrow-tab position while the real layout had the
     /// close button ~580px to the right, so the UIA click landed on the tab
     /// body). Reset by the scan that consumes it.
-    force_next_bounds_scan: bool,
+    pub(crate) force_next_bounds_scan: bool,
 }
 
 /// The bounds-sync throttle window. Bounds only need "eventually correct"

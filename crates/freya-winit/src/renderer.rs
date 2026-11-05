@@ -56,7 +56,10 @@ use winit::{
 };
 
 use crate::{
-    accessibility::AccessibilityTask,
+    accessibility::{
+        AccessibilityTask,
+        on_layout_only_change,
+    },
     config::{
         CloseDecision,
         WindowConfig,
@@ -399,9 +402,8 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                 // arming, the bounds-sync scan is throttled or deferred and
                 // the consumer keeps the pre-suspend geometry. Arm so this
                 // frame's pass re-emits the fresh coordinates.
-                app_window.accessibility.arm_bounds_scan();
                 app_window.accessibility_tasks_for_next_render |=
-                    AccessibilityTask::ProcessUpdate { mode: None };
+                    on_layout_only_change(&mut app_window.accessibility);
 
                 self.windows.insert(new_id, app_window);
 
@@ -578,9 +580,8 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                                 // point -- PartialEq saw nothing), so the bounds-sync
                                 // scan would stay throttled and serve stale geometry.
                                 // Same arm as Resized/ScaleFactorChanged above.
-                                app.accessibility.arm_bounds_scan();
                                 app.accessibility_tasks_for_next_render |=
-                                    AccessibilityTask::ProcessUpdate { mode: None };
+                                    on_layout_only_change(&mut app.accessibility);
                                 app.window.request_redraw();
                             }
                             if result.needs_accessibility {
@@ -776,9 +777,8 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                     // Same arm as the mutation frame above: this frame's
                     // RedrawRequested measures first, then runs the queued
                     // pass, so emission reads this frame's fresh coordinates.
-                    app.accessibility.arm_bounds_scan();
                     app.accessibility_tasks_for_next_render |=
-                        AccessibilityTask::ProcessUpdate { mode: None };
+                        on_layout_only_change(&mut app.accessibility);
                 }
                 WindowEvent::CloseRequested => {
                     let mut on_close_hook = self
@@ -1029,9 +1029,8 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                     // this frame's RedrawRequested measures first, then runs
                     // the queued pass, so emission reads this frame's fresh
                     // coordinates.
-                    app.accessibility.arm_bounds_scan();
                     app.accessibility_tasks_for_next_render |=
-                        AccessibilityTask::ProcessUpdate { mode: None };
+                        on_layout_only_change(&mut app.accessibility);
                 }
 
                 WindowEvent::MouseInput { state, button, .. } => {

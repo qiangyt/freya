@@ -389,11 +389,13 @@ impl TestingRunner {
     /// winit semantics being mirrored, step by step:
     /// 1. `Resized`: force a full re-layout on the new size
     ///    (`layout.clear_dirty()` + `layout.invalidate(NodeId::ROOT)`),
-    /// 2. arm the bounds-sync scan and queue the accessibility pass (the
+    /// 2. arm the bounds-sync scan and queue the accessibility pass via the
+    ///    shared decision every layout-only path in freya-winit uses
+    ///    (`freya_core::accessibility::task::on_layout_only_change`) -- the
     ///    layout-shift fix: a resize frame carries no mutation, so without
     ///    this the consumer keeps serving the pre-resize geometry until the
     ///    next mutation frame -- measured as a ~12s freeze on the
-    ///    putala-desktop probe, a 140ms mixed-generation window headless),
+    ///    putala-desktop probe, a 140ms mixed-generation window headless,
     /// 3. `RedrawRequested`: `measure_layout` on the new size, then run the
     ///    queued accessibility pass in the same frame (freya-testing has no
     ///    task queue to park it in, so "queued" and "run" are the same call --
@@ -409,7 +411,9 @@ impl TestingRunner {
             tree.layout.clear_dirty();
             tree.layout.invalidate(NodeId::ROOT);
         }
-        self.accessibility.arm_bounds_scan();
+        // The Resized half's decision, from the same source freya-winit's
+        // renderer calls (mirror drift surface: zero).
+        let owed_pass = on_layout_only_change(&mut self.accessibility);
         self.tree.borrow_mut().measure_layout(
             self.size,
             &mut self.font_collection,
@@ -417,6 +421,12 @@ impl TestingRunner {
             &self.events_sender,
             self.scale_factor,
             &self.default_fonts,
+        );
+        // The RedrawRequested half takes the queued task and runs it; the
+        // tail below IS that execution, so pin what it executes.
+        assert!(
+            matches!(owed_pass, AccessibilityTask::ProcessUpdate { mode: None }),
+            "resize must run the ProcessUpdate pass the shared decision queued"
         );
         // Same tail as `sync_and_update` (and winit's `AccessibilityTask::
         // ProcessUpdate` arm): publish the focused node / IME cursor area.
