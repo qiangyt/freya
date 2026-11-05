@@ -1234,6 +1234,157 @@ mod tests {
         );
     }
 
+    /// UI-scaling pre-work (2026-11-05): an inherited text-style change (a
+    /// font-size change) moves text bounds the same way a LAYOUT change
+    /// does -- `TextStyleState::update` already invalidates the layout and
+    /// `needs_render` includes TEXT_STYLE -- so a TEXT_STYLE-only frame must
+    /// arm the accessibility pass too. Without it the staleness is
+    /// PERMANENT, not self-healing: after this frame is consumed a quiet UI
+    /// produces no further change frame, and the 150ms pump can never
+    /// schedule the pass (its tick is gated on needs_accessibility), so the
+    /// bounds cache keeps serving the pre-change geometry forever.
+    #[test]
+    fn text_style_only_mutations_flag_accessibility() {
+        use std::collections::HashMap;
+
+        use crate::{
+            runner::{
+                MutationModified,
+                Mutations,
+            },
+            tree::DiffModifies,
+        };
+
+        let node = NodeId::from(2);
+        let mut tree = mini_tree(node, &rect_plain());
+
+        let result = tree.apply_mutations(Mutations {
+            added: vec![],
+            modified: vec![MutationModified {
+                node_id: node,
+                element: rect_plain(),
+                flags: DiffModifies::TEXT_STYLE,
+            }],
+            removed: vec![],
+            moved: HashMap::default(),
+        });
+
+        assert!(
+            result.needs_accessibility,
+            "TEXT_STYLE-only mutations must arm the accessibility pass (a pure font-size \
+             change moves text bounds; without the arm the bounds cache serves the \
+             pre-change geometry forever -- the 150ms pump does not cover this gap)"
+        );
+    }
+
+    /// UI-scaling pre-work (2026-11-05), consumer-visible half: a frame whose
+    /// only mutation is TEXT_STYLE (inherited font-size change) re-measures
+    /// A taller and pushes B down. Mirroring the renderer's arm-on-
+    /// needs_accessibility wiring, the SAME frame must flush B's fresh
+    /// bounds -- the defect shape (pre-fix) defers the flush forever because
+    /// the frame never arms the scan and a quiet UI never produces the next
+    /// change frame.
+    #[test]
+    fn text_style_frame_flushes_pushed_bounds_same_frame() {
+        use std::collections::HashMap;
+
+        use crate::{
+            runner::{
+                MutationModified,
+                Mutations,
+            },
+            tree::DiffModifies,
+        };
+
+        let a = NodeId::from(2);
+        let b = NodeId::from(3);
+        let mut tree = stacked_tree(
+            a,
+            b,
+            Area::new(Point2D::new(0.0, 0.0), Size2D::new(100.0, 20.0)),
+            Area::new(Point2D::new(0.0, 20.0), Size2D::new(100.0, 20.0)),
+        );
+        let mut a11y_tree = AccessibilityTree::new(ACCESSIBILITY_ROOT_ID);
+        let (events_sender, _events_receiver) = futures_channel::mpsc::unbounded();
+        a11y_tree.init(&mut tree);
+
+        let base = std::time::Instant::now();
+        // First pass caches B's bounds at y0=20.
+        a11y_tree.process_updates_at(&mut tree, &events_sender, base);
+        let b_id = tree.accessibility_state.get(&b).unwrap().a11y_id;
+        assert_eq!(
+            a11y_tree.bounds_cache.get(&b).map(|rect| rect.y0),
+            Some(20.0)
+        );
+
+        // The frame: A's inherited font size grows. The only mutation flag is
+        // TEXT_STYLE (no LAYOUT, no ACCESSIBILITY) -- the shape a pure
+        // font-scale change produces.
+        let result = tree.apply_mutations(Mutations {
+            added: vec![],
+            modified: vec![MutationModified {
+                node_id: a,
+                element: rect_plain(),
+                flags: DiffModifies::TEXT_STYLE,
+            }],
+            removed: vec![],
+            moved: HashMap::default(),
+        });
+
+        // The renderer arms the scan exactly when apply_mutations flags the
+        // pass (renderer.rs's needs_accessibility branch).
+        if result.needs_accessibility {
+            a11y_tree.arm_bounds_scan();
+        }
+
+        // The re-measure A's bigger font triggers: A grows, B shifts down.
+        // (The render path measures layout BEFORE the accessibility pass, so
+        // the fresh areas are already cached when the pass runs.)
+        tree.layout.cache_node(
+            a,
+            LayoutNode {
+                area: Area::new(Point2D::new(0.0, 0.0), Size2D::new(100.0, 40.0)),
+                ..Default::default()
+            },
+        );
+        tree.layout.cache_node(
+            b,
+            LayoutNode {
+                area: Area::new(Point2D::new(0.0, 40.0), Size2D::new(100.0, 20.0)),
+                ..Default::default()
+            },
+        );
+
+        // The same frame's pass, inside the throttle window: B must be
+        // re-emitted with the pushed-down bounds.
+        let update = a11y_tree.process_updates_at(
+            &mut tree,
+            &events_sender,
+            base + std::time::Duration::from_millis(10),
+        );
+        let b_bounds = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == b_id)
+            .map(|(_, node)| node.bounds().expect("bounds must be set"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a TEXT_STYLE-only frame must re-emit the pushed node with fresh bounds \
+                     (stale bounds survive otherwise: {:#?})",
+                    a11y_tree.bounds_cache.get(&b)
+                )
+            });
+        assert_eq!(
+            b_bounds.y0, 40.0,
+            "the flushed bounds must reflect the pushed-down position (y0=40), not y0=20"
+        );
+        assert_eq!(
+            a11y_tree.bounds_cache.get(&b).map(|rect| rect.y0),
+            Some(40.0),
+            "the bounds cache must be refreshed by the same frame's pass"
+        );
+    }
+
     /// The putala-desktop terminal close-button defect (2026-10-31): a LAYOUT-only
     /// mover -- a node that SHIFTED because a sibling grew, carrying NO
     /// accessibility-diff mark -- was throttled away and never re-emitted, so the

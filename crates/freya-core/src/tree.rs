@@ -372,10 +372,17 @@ impl Tree {
                 // shifted by a sibling's size change carries no
                 // ACCESSIBILITY flag, yet its accesskit bounds are stale --
                 // the pass is where the shifted bounds get flushed.
+                // TEXT_STYLE joins the family (2026-11-05, UI-scaling
+                // pre-work): an inherited font-size change re-measures text
+                // the same way (TextStyleState::update invalidates the
+                // layout), so its bounds go stale identically -- and a
+                // TEXT_STYLE-only frame on a quiet UI never produces the
+                // next change frame, making the staleness permanent.
                 if !needs_accessibility
                     && (flags.intersects(
                         DiffModifies::ACCESSIBILITY
                             | DiffModifies::LAYOUT
+                            | DiffModifies::TEXT_STYLE
                             | DiffModifies::INNER_LAYOUT
                             | DiffModifies::REORDER_LAYOUT,
                     ))
