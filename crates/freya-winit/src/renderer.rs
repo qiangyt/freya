@@ -21,10 +21,7 @@ use ragnarok::{
     EventsExecutorRunner,
     EventsMeasurerRunner,
 };
-use rustc_hash::{
-    FxHashMap,
-    FxHashSet,
-};
+use rustc_hash::FxHashMap;
 use torin::prelude::{
     CursorPoint,
     Size2D,
@@ -91,9 +88,12 @@ pub struct WinitRenderer {
     pub(crate) tray_icon: Option<TrayIcon>,
     pub resumed: bool,
     pub windows: FxHashMap<WindowId, AppWindow>,
-    /// The window ids that already own an a11y bounds pumper (the creation
-    /// paths are four; the guard keeps the pump one-per-window).
-    pub a11y_pump_windows: FxHashSet<WindowId>,
+    /// The stop handles of the windows' a11y bounds pumpers (the creation
+    /// paths are four; the map keeps the pump one-per-window). Destroying a
+    /// window sets its handle so the pump thread exits instead of ticking
+    /// forever for a window that no longer exists (see
+    /// `spawn_a11y_bounds_pump` / `stop_a11y_bounds_pump`).
+    pub a11y_pump_windows: FxHashMap<WindowId, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub proxy: EventLoopProxy<NativeEvent>,
     pub plugins: PluginsManager,
     pub fallback_fonts: Vec<Cow<'static, str>>,
@@ -114,7 +114,8 @@ pub struct RendererContext<'a> {
     pub font_collection: &'a mut FontCollection,
     pub active_event_loop: &'a ActiveEventLoop,
     pub gpu_resource_cache_limit: usize,
-    pub a11y_pump_windows: &'a mut FxHashSet<WindowId>,
+    pub a11y_pump_windows:
+        &'a mut FxHashMap<WindowId, std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// The pumper cadence: must stay within `BOUNDS_FLUSH_INTERVAL` (the
@@ -130,7 +131,8 @@ const A11Y_BOUNDS_PUMP_INTERVAL: std::time::Duration = std::time::Duration::from
 /// structurally quiet UI (no invalidations, no user input) would stop arming
 /// a11y passes entirely and a pending bounds flush would never drain (the
 /// putala-desktop 2026-10-28 row-vanish family). The thread exits when the
-/// proxy is gone (app teardown).
+/// proxy is gone (app teardown) or its stop handle is set (window destroyed,
+/// `stop_a11y_bounds_pump`).
 ///
 /// Spawned from EVERY window-creation path (the `resumed()` first-window
 /// drain, the tray `LaunchWindow`, the runtime `launch_window` extension,
@@ -142,22 +144,27 @@ const A11Y_BOUNDS_PUMP_INTERVAL: std::time::Duration = std::time::Duration::from
 /// window id per event (a pump per recreate would leak threads) and the
 /// recreate path already sends `PollRunner` itself.
 fn spawn_a11y_bounds_pump(
-    pumped: &mut FxHashSet<WindowId>,
+    pumped: &mut FxHashMap<WindowId, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     proxy: &EventLoopProxy<NativeEvent>,
     window_id: WindowId,
 ) {
     if cfg!(target_os = "android") {
         return;
     }
-    if !pumped.insert(window_id) {
+    if pumped.contains_key(&window_id) {
         return;
     }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = stop.clone();
     let proxy = proxy.clone();
     std::thread::Builder::new()
         .name("a11y-bounds-pump".into())
         .spawn(move || {
             loop {
                 std::thread::sleep(A11Y_BOUNDS_PUMP_INTERVAL);
+                if thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
                 if proxy
                     .send_event(NativeEvent::Window(NativeWindowEvent {
                         window_id,
@@ -170,6 +177,27 @@ fn spawn_a11y_bounds_pump(
             }
         })
         .ok();
+    pumped.insert(window_id, stop);
+}
+
+/// Signals a destroyed window's pump to exit and forgets the one-per-window
+/// guard so a future window minting the same id can pump again. Without this
+/// the pump keeps ticking every interval for a window that no longer exists:
+/// its `PollRunner` lands on a `windows.get_mut` lookup that misses and gets
+/// skipped, so a single window is unaffected but every open/close cycle
+/// strands one zombie thread for the rest of the process (the resource leak
+/// named by the 2026-11-05 review).
+fn stop_a11y_bounds_pump(
+    pumped: &mut FxHashMap<WindowId, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    window_id: WindowId,
+) -> bool {
+    match pumped.remove(&window_id) {
+        Some(stop) => {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            true
+        }
+        None => false,
+    }
 }
 
 impl RendererContext<'_> {
@@ -692,6 +720,12 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                                     NativeWindowErasedEventAction::CloseWindow(window_id) => {
                                         // Its fine to ignore if the window doesnt exist anymore
                                         let _ = self.windows.remove(&window_id);
+                                        // The window is gone -- its pump must
+                                        // go too (see `stop_a11y_bounds_pump`).
+                                        stop_a11y_bounds_pump(
+                                            &mut self.a11y_pump_windows,
+                                            window_id,
+                                        );
                                         let has_windows = !self.windows.is_empty();
 
                                         let has_tray = {
@@ -811,6 +845,9 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
 
                     if matches!(decision, CloseDecision::Close) {
                         self.windows.remove(&window_id);
+                        // The window is gone -- its pump must go too (see
+                        // `stop_a11y_bounds_pump`).
+                        stop_a11y_bounds_pump(&mut self.a11y_pump_windows, window_id);
                         let has_windows = !self.windows.is_empty();
 
                         let has_tray = {
@@ -1337,4 +1374,79 @@ fn subscribe_preferences(proxy: EventLoopProxy<NativeEvent>) {
         let _ = proxy.send_event(NativeEvent::Preferences(prefs));
     });
     std::mem::forget(subscription);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
+    };
+
+    use super::{
+        FxHashMap,
+        WindowId,
+        stop_a11y_bounds_pump,
+    };
+
+    fn fresh_stop() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    /// The 2026-11-05 zombie-pump fix: destroying a window must set its
+    /// pump's stop handle AND drop the one-per-window guard, so the SAME id
+    /// minting a new window can arm a fresh pump while the retired handle
+    /// stays flagged. Pre-fix the handles did not exist and the pump ticked
+    /// until app teardown (one stranded thread per open/close cycle).
+    /// (winit's public API only offers `WindowId::dummy()`, so the guard
+    /// semantics are pinned through id reuse rather than distinct ids.)
+    #[test]
+    fn stopping_a_window_pump_flags_it_and_allows_rearming_the_id() {
+        let id = WindowId::dummy();
+        let first = fresh_stop();
+        let mut pumped = FxHashMap::default();
+        pumped.insert(id, first.clone());
+
+        assert!(
+            stop_a11y_bounds_pump(&mut pumped, id),
+            "stopping a live pump must report success"
+        );
+        assert!(
+            first.load(Ordering::Acquire),
+            "the destroyed window's pump must see the stop flag"
+        );
+        assert!(
+            !pumped.contains_key(&id),
+            "the one-per-window guard must be dropped so the id can pump again"
+        );
+
+        // A new window mints the same id: its fresh pump is armed and
+        // unflagged, and the retired handle keeps its stop set.
+        let second = fresh_stop();
+        pumped.insert(id, second.clone());
+        assert!(
+            !second.load(Ordering::Acquire),
+            "the re-armed pump must start unflagged"
+        );
+
+        assert!(stop_a11y_bounds_pump(&mut pumped, id));
+        assert!(second.load(Ordering::Acquire));
+        assert!(first.load(Ordering::Acquire));
+        assert!(!pumped.contains_key(&id));
+    }
+
+    /// Stopping an unknown window (double close, already-destroyed id) is a
+    /// no-op -- the close paths call it unconditionally.
+    #[test]
+    fn stopping_an_unknown_window_pump_is_a_noop() {
+        let mut pumped: FxHashMap<WindowId, Arc<AtomicBool>> = FxHashMap::default();
+        assert!(
+            !stop_a11y_bounds_pump(&mut pumped, WindowId::dummy()),
+            "stopping an unknown id must report failure, not panic"
+        );
+        assert!(pumped.is_empty());
+    }
 }
