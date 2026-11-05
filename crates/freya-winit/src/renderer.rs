@@ -394,6 +394,14 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                 app_window.window = new_window;
                 app_window.process_layout_on_next_render = true;
                 app_window.tree.layout.reset();
+                // The rebuilt window re-layouts every node, but the rebuild
+                // carries NO mutation -- same shape as Resized: without
+                // arming, the bounds-sync scan is throttled or deferred and
+                // the consumer keeps the pre-suspend geometry. Arm so this
+                // frame's pass re-emits the fresh coordinates.
+                app_window.accessibility.arm_bounds_scan();
+                app_window.accessibility_tasks_for_next_render |=
+                    AccessibilityTask::ProcessUpdate { mode: None };
 
                 self.windows.insert(new_id, app_window);
 
@@ -566,6 +574,13 @@ impl ApplicationHandler<NativeEvent> for WinitRenderer {
                                 // Hot-patches can change closure bodies and custom `ElementExt` impls
                                 // that `PartialEq` can't observe, so force a layout + redraw.
                                 app.process_layout_on_next_render = true;
+                                // The forced re-layout carries no mutation (that is the
+                                // point -- PartialEq saw nothing), so the bounds-sync
+                                // scan would stay throttled and serve stale geometry.
+                                // Same arm as Resized/ScaleFactorChanged above.
+                                app.accessibility.arm_bounds_scan();
+                                app.accessibility_tasks_for_next_render |=
+                                    AccessibilityTask::ProcessUpdate { mode: None };
                                 app.window.request_redraw();
                             }
                             if result.needs_accessibility {

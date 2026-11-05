@@ -407,6 +407,13 @@ impl AppWindow {
         self.process_layout_on_next_render = true;
         self.tree.layout.reset();
         self.tree.text_cache.reset();
+        // A zoom change re-layouts every node, but carries NO mutation --
+        // same shape as ScaleFactorChanged (which this mirrors): without
+        // arming, the bounds-sync scan is throttled or deferred and the
+        // consumer keeps the pre-zoom geometry until a later mutation
+        // frame. Arm so this frame's pass re-emits the fresh coordinates.
+        self.accessibility.arm_bounds_scan();
+        self.accessibility_tasks_for_next_render |= AccessibilityTask::ProcessUpdate { mode: None };
         self.window.request_redraw();
     }
 
