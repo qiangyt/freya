@@ -174,6 +174,7 @@ pub struct Input {
     placeholder: Option<Cow<'static, str>>,
     on_validate: Option<EventHandler<InputValidator>>,
     on_submit: Option<EventHandler<String>>,
+    on_selection_change: Option<EventHandler<(usize, usize)>>,
     mode: InputMode,
     auto_focus: bool,
     width: Size,
@@ -203,6 +204,7 @@ impl Input {
             placeholder: None,
             on_validate: None,
             on_submit: None,
+            on_selection_change: None,
             mode: InputMode::default(),
             auto_focus: false,
             width: Size::px(150.),
@@ -245,6 +247,21 @@ impl Input {
 
     pub fn on_submit(mut self, on_submit: impl Into<EventHandler<String>>) -> Self {
         self.on_submit = Some(on_submit.into());
+        self
+    }
+
+    /// Subscribe to selection changes of the input.
+    ///
+    /// The payload `(from, to)` uses **UTF-16 code units**, matching freya's internal
+    /// selection unit: `from` is the selection anchor, `to` is the moving end, so a
+    /// backward (right-to-left) selection has `from > to`. `from == to` means a
+    /// collapsed caret. The callback only fires when the selection actually changed
+    /// since the last notification (duplicated or unchanged values are suppressed).
+    pub fn on_selection_change(
+        mut self,
+        on_selection_change: impl Into<EventHandler<(usize, usize)>>,
+    ) -> Self {
+        self.on_selection_change = Some(on_selection_change.into());
         self
     }
 
@@ -357,6 +374,34 @@ impl Component for Input {
         let mut is_dragging = use_state(|| false);
         let mut value = self.value.clone();
 
+        // Latest selection notified through `on_selection_change`, used to debounce
+        // notifications. Seeded with the selection at mount time so that mounting
+        // does not trigger a notification.
+        let selection_snapshot = use_hook(|| {
+            Rc::new(RefCell::new(Some(selection_point(
+                editable.editor().peek().selection(),
+            ))))
+        });
+        // Notify `on_selection_change` with the given editor selection, unless it did
+        // not change since the previous notification. All selection mutations happen
+        // in this component, so the snapshot stays valid across renders.
+        let notify_selection_change: Rc<dyn Fn(&RopeEditor)> = {
+            let on_selection_change = self.on_selection_change.clone();
+            let selection_snapshot = selection_snapshot.clone();
+            Rc::new(move |editor: &RopeEditor| {
+                let Some(on_selection_change) = on_selection_change.as_ref() else {
+                    return;
+                };
+                let selection = selection_point(editor.selection());
+                let mut snapshot = selection_snapshot.borrow_mut();
+                if snapshot.as_ref() != Some(&selection) {
+                    *snapshot = Some(selection);
+                    drop(snapshot);
+                    on_selection_change.call(selection);
+                }
+            })
+        };
+
         let theme_colors = match self.style_variant {
             InputStyleVariant::Normal => {
                 get_theme!(&self.theme_colors, InputColorsThemePreference, "input")
@@ -410,7 +455,17 @@ impl Component for Input {
             editor.set(&value.read());
             editor.editor_history().clear();
             editor.clear_selection();
+            // External value reset, notify during this render on purpose: the reset
+            // itself already writes internal state during render.
+            notify_selection_change(&editor);
         }
+
+        // One clone of the notifier per handler, since handlers own their captures.
+        let notify_on_ime_preedit = notify_selection_change.clone();
+        let notify_on_key_down = notify_selection_change.clone();
+        let notify_on_input_focus_press = notify_selection_change.clone();
+        let notify_on_focus_press = notify_selection_change.clone();
+        let notify_on_global_pointer_move = notify_selection_change.clone();
 
         let on_ime_preedit = move |e: Event<ImePreeditEventData>| {
             let mut editor = editable.editor_mut().write();
@@ -419,6 +474,7 @@ impl Component for Input {
             } else {
                 editor.set_preedit(&e.data().text);
             }
+            notify_on_ime_preedit(&editor);
         };
 
         let on_pre_key_down = self.on_pre_key_down.clone();
@@ -473,6 +529,9 @@ impl Component for Input {
                     }
                 }
             }
+
+            let editor = editable.editor().peek();
+            notify_on_key_down(&editor);
         };
 
         let on_key_up = move |e: Event<KeyboardEventData>| {
@@ -501,6 +560,8 @@ impl Component for Input {
                     editor_line: EditorLine::SingleParagraph,
                     holder: &holder.read(),
                 });
+                let editor = editable.editor().peek();
+                notify_on_input_focus_press(&editor);
             }
             a11y_id.request_focus();
         };
@@ -523,6 +584,8 @@ impl Component for Input {
                     editor_line: EditorLine::SingleParagraph,
                     holder: &holder.read(),
                 });
+                let editor = editable.editor().peek();
+                notify_on_focus_press(&editor);
             }
             a11y_id.request_focus();
         };
@@ -537,6 +600,8 @@ impl Component for Input {
                     editor_line: EditorLine::SingleParagraph,
                     holder: &holder.read(),
                 });
+                let editor = editable.editor().peek();
+                notify_on_global_pointer_move(&editor);
             }
         };
 
@@ -733,5 +798,13 @@ impl Component for Input {
 
     fn render_key(&self) -> DiffKey {
         self.key.clone().or(self.default_key())
+    }
+}
+
+/// Map a [`TextSelection`] into its `(anchor, focus)` endpoints, in UTF-16 code units.
+fn selection_point(selection: &TextSelection) -> (usize, usize) {
+    match selection {
+        TextSelection::Cursor(pos) => (*pos, *pos),
+        TextSelection::Range { from, to } => (*from, *to),
     }
 }
