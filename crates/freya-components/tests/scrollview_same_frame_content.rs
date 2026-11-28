@@ -108,3 +108,82 @@ pub fn scroll_view_tracks_content_appended_in_the_same_frame_as_scrolling() {
         "滚到底后最后一条的布局底边必须落在视口底内（实测 {last_bottom}）"
     );
 }
+
+/// C27 第二枚钉（2026-11-28 桌面实证的必要面）：**静默期追加**——追加帧只含
+/// ADD 变更（无同帧滚动），滚动位置处于旧范围末端。ADD 只把新节点标脏、不
+/// 失效父链（修 C 之前）→ fill 高度的滚动内容矩形从缓存取尺寸、inner_sizes
+/// 吞掉新条目高度 → 滚轮钳在旧范围（桌面实证：审批卡在视口外加入后钳在真
+/// 底部上方约一个卡高，布局把卡片排在折叠之下、按钮点击落进 composer）。
+/// 修 C = ADD 与 REMOVE 对称地失效父节点。
+#[test]
+pub fn scroll_view_reaches_true_bottom_for_content_appended_while_idle() {
+    fn idle_append_app() -> impl IntoElement {
+        let mut items = use_state(|| vec![200.0f32; 6]);
+
+        rect()
+            .child(
+                rect()
+                    .width(Size::fill())
+                    .height(Size::px(20.0))
+                    .on_pointer_down(move |_| items.write().push(200.0))
+                    .child("append"),
+            )
+            .child(
+                ScrollView::new()
+                    .show_scrollbar(false)
+                    .children(items.read().iter().map(|height| {
+                        rect()
+                            .width(Size::fill())
+                            .height(Size::px(*height))
+                            .into_element()
+                    })),
+            )
+    }
+
+    let mut test = launch_test(idle_append_app);
+    let scrollview = test
+        .find(|node, element| {
+            Rect::try_downcast(element)
+                .filter(|rect| rect.accessibility.builder.role() == AccessibilityRole::ScrollView)
+                .map(move |_| node)
+        })
+        .unwrap();
+    let content = scrollview.children().remove(0).children().remove(0);
+
+    // 基线：6 条 × 200 = 1200，视口 480，最大可达偏移 720。先下滚到旧范围
+    // 末端（模拟桌面「读到历史中段/旧范围末端」的静默态）。
+    test.scroll((250.0, 250.0), (0.0, -10000.0));
+    test.sync_and_update();
+    assert_eq!(content.layout().offset_y.get(), -720.0);
+
+    // 静默期追加 1 条（追加帧只含 ADD 变更）：内容总高 1200 → 1400，真实
+    // 最大偏移 720 → 920。
+    test.send_event(PlatformEvent::Mouse {
+        name: MouseEventName::MouseDown,
+        cursor: (250.0, 10.0).into(),
+        button: Some(MouseButton::Left),
+    });
+    test.sync_and_update();
+
+    // 坏帧断言：追加帧结束时内容缓存必须已含新条目（修 C 前停在 1200）。
+    assert_eq!(
+        content.layout().inner_sizes.height,
+        1400.0,
+        "静默期追加帧结束时，内容累计高度必须等于全部条目总高"
+    );
+
+    // 收敛断言：持续下滚必须到达真实最大值 1120，最后一条布局底边落回视口。
+    test.scroll((250.0, 250.0), (0.0, -10000.0));
+    test.scroll((250.0, 250.0), (0.0, -10000.0));
+    assert_eq!(
+        content.layout().offset_y.get(),
+        -920.0,
+        "持续下滚必须到达真实最大值 1400 减视口 480"
+    );
+    let items = content.children();
+    let last_bottom = items[6].layout().area.to_f64().max_y();
+    assert!(
+        last_bottom <= 500.0,
+        "滚到底后最后一条的布局底边必须落在视口底内（实测 {last_bottom}）"
+    );
+}

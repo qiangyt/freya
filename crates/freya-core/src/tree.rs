@@ -276,6 +276,13 @@ impl Tree {
 
                 self.elements.insert(node_id, element);
                 dirty.push((node_id, DiffModifies::all()));
+                // 修 C（2026-11-28，桌面 C27 的必要面，与 REMOVE 的
+                // invalidate(parent_id) 对称）：ADD 只标新节点自身时，不依赖
+                // 子内容尺寸的祖先（fill 高度滚动容器）不会重测，其 inner_sizes
+                // 停在旧值——滚动范围吞掉新增长（实证：审批卡在视口外加入后
+                // 滚轮钳在真底部上方一个卡高）。invalidate 用 insert 覆写语义，
+                // 顺带把同帧的 InnerLayout 升级为 None（torin 修 A 的入口面）。
+                self.layout.invalidate(parent_id);
             }
 
             for (parent_node_id, movements) in mutations.moved {
