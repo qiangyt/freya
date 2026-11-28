@@ -208,7 +208,18 @@ impl<Key: NodeKey> Torin<Key> {
         ignore: bool,
     ) {
         if self.dirty.contains_key(&node_id) && ignore {
-            return;
+            // Reason-aware upgrade (the same-frame scroll + content-change fix):
+            // an existing InnerLayout mark only means "the offsets moved", while a
+            // fresh None/Reorder invalidation means the content itself changed.
+            // Leaving InnerLayout in place would route the measure pass into the
+            // translate-only fast path and silently drop that change, so the mark
+            // is upgraded and the parent-chain walk continues.
+            let upgrade = matches!(self.dirty.get(&node_id), Some(DirtyReason::InnerLayout))
+                && matches!(reason, DirtyReason::None | DirtyReason::Reorder);
+            if !upgrade {
+                return;
+            }
+            self.dirty.insert(node_id, reason);
         }
 
         // Mark this node as dirty

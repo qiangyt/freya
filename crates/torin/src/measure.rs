@@ -493,7 +493,7 @@ where
 
             (must_cache_children, layout_node)
         } else {
-            let layout_node = self
+            let mut layout_node = self
                 .layout
                 .get(&node_id)
                 .expect("Cached node does not exist")
@@ -521,6 +521,35 @@ where
                     must_cache_children,
                     false,
                 );
+            }
+
+            // The cached branch used to drop re-measured children's accumulated
+            // sizes on the floor: the node itself was clean, so neither the
+            // layout listeners heard about the new inner sizes nor was the cache
+            // updated (scroll containers read their content size through exactly
+            // those two faces). When the accumulation moved, notify the layout
+            // references (padded, the same shape the fresh-measure branch sends)
+            // and cache the node with the new inner sizes (unpadded, the same
+            // shape the fresh-measure branch caches).
+            if measure_inner_children
+                && must_cache_children
+                && phase == Phase::Final
+                && node.has_layout_references
+                && inner_sizes != layout_node.inner_sizes
+            {
+                if let Some(measurer) = self.measurer {
+                    let mut notify_sizes = inner_sizes;
+                    notify_sizes.width += node.padding.horizontal();
+                    notify_sizes.height += node.padding.vertical();
+                    measurer.notify_layout_references(
+                        node_id,
+                        layout_node.area,
+                        layout_node.visible_area(),
+                        notify_sizes,
+                    );
+                }
+                layout_node.inner_sizes = inner_sizes;
+                self.layout.cache_node(node_id, layout_node.clone());
             }
 
             (false, layout_node)
