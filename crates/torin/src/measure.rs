@@ -160,10 +160,19 @@ where
     ) -> (bool, LayoutNode) {
         let reason = self.layout.dirty.get(&node_id).copied();
 
-        // If possible translate all this Node's descendants to avoid relayout
+        // If possible translate all this Node's descendants to avoid relayout.
+        // The shortcut is only valid while the parent chain stands still: when
+        // the parent itself was freshly re-measured this pass (parent_is_dirty),
+        // the area this node would occupy may have changed (e.g. a flex/fill
+        // viewport shrunk by a sibling), and translating the cached subtree
+        // would keep the stale size forever -- no Sized event ever carries the
+        // new viewport (2026-11-28, desktop C27 second facet: the scroll clamp
+        // kept using the old 440px viewport against the real 327px one).
+        // Scroll-only frames keep the shortcut (the parent stays cached).
         if let Some(layout_node) = self.layout.get_mut(&node_id)
             && reason == Some(DirtyReason::InnerLayout)
             && must_cache_children
+            && !parent_is_dirty
         {
             // Get the offset difference since the last layout
             let offset_x = node.offset_x - layout_node.offset_x;
